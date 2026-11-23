@@ -1,0 +1,9 @@
+{
+  "name": "garmoosha-mail",
+  "label": "Falconi email",
+  "description": "Lets Falconi check and show an agent's email account.",
+  "version": "1.0.0",
+  "tab": { "hidden": true },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}
