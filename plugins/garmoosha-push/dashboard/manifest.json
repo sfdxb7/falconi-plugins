@@ -1,0 +1,10 @@
+{
+  "name": "garmoosha-push",
+  "label": "Falki notifications",
+  "description": "Notifications for Falki's Android app, with the app closed.",
+  "icon": "Bell",
+  "version": "1.1.0",
+  "tab": { "path": "/garmoosha-push", "hidden": true },
+  "entry": "index.js",
+  "api": "plugin_api.py"
+}

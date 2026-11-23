@@ -1,0 +1,6 @@
+name: garmoosha-voice
+version: 1.2.0
+description: Lets Falki's live voice calls use this Hermes's own ChatGPT sign-in (a ChatGPT Plus or Pro plan) instead of an OpenAI API key. Hermes sends the requests; the token never leaves Hermes.
+author: Falki
+requires_auth:
+  - openai-codex

@@ -1,0 +1,9 @@
+name: garmoosha-push
+version: 1.1.0
+description: Tells Falki's Android app when a reply finishes or a bot needs an OK, with the app closed. Notes are encrypted to the phone before they leave Hermes; a push relay (or the app's own connection) only carries ciphertext.
+author: Falki
+provides_hooks:
+  - pre_approval_request
+  - post_approval_response
+  - post_llm_call
+  - on_session_end

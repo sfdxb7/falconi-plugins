@@ -1,0 +1,10 @@
+{
+  "name": "garmoosha-voice",
+  "label": "Falki voice",
+  "description": "Falki's live voice on your own ChatGPT plan.",
+  "icon": "Mic",
+  "version": "1.2.0",
+  "tab": { "path": "/garmoosha-voice", "hidden": true },
+  "entry": "index.js",
+  "api": "plugin_api.py"
+}
