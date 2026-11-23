@@ -431,7 +431,7 @@ def _profile() -> str:
 
 
 def _title(profile: str) -> str:
-    return "Falki" if profile == "default" else _clip(profile, 60)
+    return "Falconi" if profile == "default" else _clip(profile, 60)
 
 
 ASK_ROOM = 140 - len("Wants to run “”")
@@ -564,7 +564,7 @@ def events_after(device_id: str, after: int) -> list[dict]:
 #
 # Which process that is varies: under the image's s6 setup the dashboard app (and so these routes)
 # is imported by `hermes dashboard`, by the gateway (gateway/run_api.py mounts it on its own
-# listener, which serves /api/ws and so Falki's chats), and by other processes that load it; in the
+# listener, which serves /api/ws and so Falconi's chats), and by other processes that load it; in the
 # e2e run the gateway served every route and ran the agent. Which one imported last says nothing, so
 # it's decided in-process: a note carries Approve/Deny only when this process has itself served a
 # request on these routes (the app calls /status and /devices on every start) and so is the one
