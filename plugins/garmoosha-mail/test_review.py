@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import sqlite3
+from contextlib import closing
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
@@ -211,7 +212,7 @@ with queue.delivery_lock(sys.argv[3]) as acquired:
         self.assertIsNone(page[1]["draft"])
         self.assertEqual([item["id"] for item in self.queue.list("mailbox", before=action, include_actions=True)], [older])
         # These are the 1.3 dashboard's account selectors, including after a downgrade.
-        with sqlite3.connect(self.queue.path) as db:
+        with closing(sqlite3.connect(self.queue.path)) as db, db:
             rows = db.execute("SELECT id FROM mail_review WHERE account = ? ORDER BY rowid DESC", ("mailbox",))
             self.assertEqual(list(rows), [(newer,), (older,)])
             approve = db.execute(
@@ -220,6 +221,29 @@ with queue.delivery_lock(sys.argv[3]) as acquired:
                 ("mailbox", action),
             )
             self.assertEqual(approve.rowcount, 0)
+
+    def test_legacy_insert_cannot_reopen_a_completed_recommendation(self):
+        action, _ = self.queue.propose("mailbox", "source", self.source, "Choose a new date", None)
+        self.queue.decide("mailbox", action, 1, "completed")
+        with closing(sqlite3.connect(self.queue.path)) as db, db:
+            # The released reply-only writer uses this INSERT followed by its account lookup.
+            for legacy_id in ("first-legacy-attempt", "second-legacy-attempt"):
+                result = db.execute(
+                    """INSERT INTO mail_review (id, account, source_key, source, recommendation, draft, status,
+                        revision, updated_at) VALUES (?, 'mailbox', 'source', '{}', 'Reply', '{}', 'proposed', 1, 1)
+                        ON CONFLICT(account, source_key) DO NOTHING""",
+                    (legacy_id,),
+                )
+                self.assertEqual(result.rowcount, 0)
+                legacy = db.execute(
+                    "SELECT id, status, recommendation FROM mail_review WHERE account = 'mailbox' AND source_key = 'source'",
+                ).fetchone()
+                self.assertEqual(legacy, ("first-legacy-attempt", "completed", ""))
+        self.assertEqual(self.queue.list("mailbox"), [])
+        self.assertIsNone(self.queue.get("mailbox", "first-legacy-attempt"))
+        items = self.queue.list("mailbox", include_actions=True)
+        self.assertEqual([(item["id"], item["status"]) for item in items], [(action, "completed")])
+        self.assertEqual(self.propose(), (action, False))
 
     def test_action_items_keep_the_decision_and_cannot_become_a_reply(self):
         account = mail.Account("me@example.test", "fixture", "imap.example.test", "smtp.example.test")

@@ -34,6 +34,22 @@ CREATE TABLE IF NOT EXISTS mail_review (
 );
 CREATE INDEX IF NOT EXISTS mail_review_account ON mail_review (account, updated_at DESC, id);
 CREATE INDEX IF NOT EXISTS mail_review_delivery ON mail_review (account, status);
+
+-- A reply-only writer can remain active during an upgrade or rollback. It
+-- resolves duplicates by reading its own account and source after INSERT.
+-- Give it a closed marker with no message content instead of a second proposal.
+CREATE TRIGGER IF NOT EXISTS mail_review_legacy_duplicate
+BEFORE INSERT ON mail_review
+WHEN NEW.status = 'proposed' AND EXISTS (
+    SELECT 1 FROM mail_review WHERE account = 'action:' || NEW.account AND source_key = NEW.source_key
+)
+BEGIN
+    INSERT INTO mail_review (id, account, source_key, source, recommendation, draft, status, revision, updated_at, receipt)
+    VALUES (NEW.id, NEW.account, NEW.source_key, '{"id":"","from":[],"subject":"","date":null}', '',
+        '{"to":[],"cc":[],"bcc":[],"subject":"","body":""}', 'completed', NEW.revision, NEW.updated_at, '{"kind":"legacy_duplicate"}')
+    ON CONFLICT(account, source_key) DO NOTHING;
+    SELECT RAISE(IGNORE);
+END;
 """
 _ABANDONED_AFTER_MS = 15 * 60 * 1000
 
@@ -168,7 +184,7 @@ class ReviewQueue:
                         )
             actions = _action_account(account) if include_actions else account
             rows = db.execute(
-                """SELECT * FROM mail_review WHERE account IN (?, ?) AND
+                """SELECT * FROM mail_review WHERE account IN (?, ?) AND receipt IS NOT '{"kind":"legacy_duplicate"}' AND
                     (? IS NULL OR rowid < (SELECT rowid FROM mail_review WHERE account IN (?, ?) AND id = ?))
                     ORDER BY rowid DESC
                     LIMIT ?""",
@@ -179,7 +195,8 @@ class ReviewQueue:
     def get(self, account: str, proposal_id: str) -> dict[str, Any] | None:
         with closing(self._connect()) as db:
             row = db.execute(
-                "SELECT * FROM mail_review WHERE account IN (?, ?) AND id = ?",
+                """SELECT * FROM mail_review WHERE account IN (?, ?) AND id = ?
+                    AND receipt IS NOT '{"kind":"legacy_duplicate"}'""",
                 (account, _action_account(account), proposal_id),
             ).fetchone()
             return _row(row) if row else None
