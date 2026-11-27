@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from dataclasses import asdict
 from hashlib import sha256
 import json
@@ -10,6 +12,8 @@ from typing import Any
 
 from . import mail
 from .review import ReviewQueue
+
+_delivery = ThreadPoolExecutor(max_workers=2, thread_name_prefix="falconi-mail-review")
 
 
 def _queue() -> ReviewQueue:
@@ -54,8 +58,9 @@ def propose_reply(account: mail.Account, args: dict[str, Any]) -> dict[str, Any]
         "from": original["from"],
         "subject": original["subject"],
         "date": original["date"],
+        "digest": mail.reply_source_digest(original),
     }
-    source_key = json.dumps([source_id, original["message_id"]], ensure_ascii=False)
+    source_key = f"message:{source['digest']}" if original["message_id"] else f"locator:{source_id}"
     proposal_id, created = _queue().propose(_scope(account), source_key, source, recommendation, asdict(draft))
     return {"id": proposal_id, "created": created}
 
@@ -76,8 +81,12 @@ def _revision(args: dict[str, Any]) -> tuple[str, int]:
 
 
 def list_proposals(args: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
-    account = _account()
-    return {"account": account.address, "items": _queue().list(_scope(account))}
+    account = mail.saved_account()
+    if account is None:
+        return {"account": None, "items": [], "next": None}
+    before = _text(args, "before", 64) if args.get("before") is not None else None
+    rows = _queue().list(_scope(account), limit=51, before=before)
+    return {"account": account.address, "items": rows[:50], "next": rows[49]["id"] if len(rows) == 51 else None}
 
 
 def edit_proposal(args: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
@@ -105,3 +114,59 @@ def decide_proposal(args: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
         raise ValueError("Choose approve, ignore or complete")
     item = _queue().decide(_scope(account), proposal_id, revision, choice)
     return {"ok": True, "item": item} if item else {"ok": False, "reason": "changed"}
+
+
+def _deliver(queue: ReviewQueue, scope: str, proposal_id: str, revision: int) -> None:
+    # Do not start SMTP from a snapshot that merely waited in the executor.
+    item = queue.claim(scope, proposal_id, revision)
+    if item is None:
+        return
+    try:
+        account = mail.saved_account()
+    except Exception:
+        account = None
+    if account is None or _scope(account) != scope:
+        queue.settle(scope, proposal_id, revision, {"kind": "account_changed"}, outcome="failed")
+        return
+    try:
+        result = mail.send(
+            account, mail.draft_from_args(item["draft"]), expected_source=item["source"]["digest"],
+        )
+    except Exception as exc:
+        # SMTP may have accepted the message before the connection broke. Do
+        # not reopen its approval or infer that a second attempt is safe.
+        kind = exc.kind if isinstance(exc, mail.MailError) else ""
+        definitely_unsent = kind in ("source_changed", "not_found", "refused", "wrong_password", "app_password")
+        receipt = {"kind": kind} if definitely_unsent else {}
+        queue.settle(scope, proposal_id, revision, receipt, outcome="failed" if definitely_unsent else "uncertain")
+        return
+    receipt = {"message_id": result["message_id"], "refused": result.get("refused", [])}
+    queue.settle(scope, proposal_id, revision, receipt, outcome="sent")
+
+
+def send_proposals(args: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+    """An authenticated client's final Send action. No agent tool calls this."""
+    selections = args.get("items")
+    if not isinstance(selections, list) or not 1 <= len(selections) <= 20:
+        raise ValueError("Select between 1 and 20 approved replies")
+    if any(not isinstance(selection, dict) for selection in selections):
+        raise ValueError("Select an exact revision for each reply")
+    revisions = [_revision(selection) for selection in selections]
+    if len({proposal_id for proposal_id, _ in revisions}) != len(revisions):
+        raise ValueError("Select each reply once")
+
+    account = _account()
+    queue = _queue()
+    scope = _scope(account)
+    results = []
+    for proposal_id, revision in revisions:
+        started = queue.queue_send(scope, proposal_id, revision) is not None
+        if started:
+            try:
+                _delivery.submit(copy_context().run, _deliver, queue, scope, proposal_id, revision)
+            except RuntimeError:
+                # The delivery executor was already shutting down.
+                queue.release_queued(scope, proposal_id, revision)
+                started = False
+        results.append({"id": proposal_id, "started": started})
+    return {"items": results}

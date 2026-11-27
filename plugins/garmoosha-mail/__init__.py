@@ -277,11 +277,7 @@ def register(ctx) -> None:
     available = _uncached(_available)
     for schema, handler in ((SEARCH, email_search), (READ, email_read), (DRAFT, email_draft), (SEND, email_send)):
         ctx.register_tool(name=schema["name"], toolset=TOOLSET, schema=schema, handler=handler, check_fn=available, emoji="✉️")
-    if callable(getattr(ctx, "register_rpc", None)):
-        ctx.register_rpc("review.list", review_api.list_proposals)
-        ctx.register_rpc("review.edit", review_api.edit_proposal)
-        ctx.register_rpc("review.decide", review_api.decide_proposal)
-        ctx.register_tool(name=PROPOSE_REPLY["name"], toolset=TOOLSET, schema=PROPOSE_REPLY,
-                          handler=email_propose_reply, check_fn=available, emoji="✉️")
+    ctx.register_tool(name=PROPOSE_REPLY["name"], toolset=TOOLSET, schema=PROPOSE_REPLY,
+                      handler=email_propose_reply, check_fn=available, emoji="✉️")
     ctx.register_hook("pre_tool_call", _ask_before_sending)
     ctx.register_hook("post_approval_response", _note_answer)

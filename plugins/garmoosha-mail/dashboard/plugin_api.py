@@ -14,35 +14,35 @@ wrong_password, app_password, unreachable, tls or unknown. The password never co
 from __future__ import annotations
 
 import asyncio
-import importlib.util
+from hashlib import sha256
+from importlib import import_module
 import logging
 import sys
 from pathlib import Path
+from types import ModuleType
 from typing import Any, Optional, Union
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 log = logging.getLogger(__name__)
 router = APIRouter()
 
 
-def _core():
-    name = "garmoosha_mail_dashboard_core"
-    if name in sys.modules:
-        return sys.modules[name]
-    spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().parent.parent / "mail.py")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(name, None)
-        raise
-    return module
+def _package() -> str:
+    # Hermes loads dashboard routers by path, outside the plugin's package.
+    # Give this installed copy a package so both handlers share the mail types.
+    root = Path(__file__).resolve().parent.parent
+    name = "garmoosha_mail_dashboard_" + sha256(str(root).encode()).hexdigest()[:16]
+    package = ModuleType(name)
+    package.__path__ = [str(root)]
+    sys.modules.setdefault(name, package)
+    return name
 
 
-mail = _core()
+_name = _package()
+mail = import_module(f"{_name}.mail")
+review = import_module(f"{_name}.review_api")
 
 # One check at a time per agent: each is a real sign-in, and providers lock out bursts of them.
 _locks: dict[str, asyncio.Lock] = {}
@@ -147,3 +147,30 @@ async def check(body: Optional[CheckRequest] = None):
         except Exception as exc:  # anything else is still an answer, never the password
             log.warning("garmoosha-mail check failed: %s", type(exc).__name__)
             return {"ok": False, "error": mail.classify(exc, "imap", account).public()}
+
+
+async def _review_action(handler, body: dict[str, Any]):
+    try:
+        return await asyncio.to_thread(handler, body)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+
+
+@router.get("/review")
+async def list_reviews(before: Optional[str] = None):
+    return await _review_action(review.list_proposals, {"before": before})
+
+
+@router.post("/review/edit")
+async def edit_review(body: dict[str, Any]):
+    return await _review_action(review.edit_proposal, body)
+
+
+@router.post("/review/decide")
+async def decide_review(body: dict[str, Any]):
+    return await _review_action(review.decide_proposal, body)
+
+
+@router.post("/review/send")
+async def send_reviews(body: dict[str, Any]):
+    return await _review_action(review.send_proposals, body)

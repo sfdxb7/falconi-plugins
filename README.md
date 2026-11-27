@@ -16,4 +16,6 @@ hermes plugins install sfdxb7/falconi-plugins/plugins/garmoosha-screen --ref <co
 
 The folder and plugin names keep their original `garmoosha-*` names so existing installs and lookups (plugin keys, routes, approval rules) keep working.
 
+For proactive mail checks, use the existing Hermes routine editor for the agent with the connected account. An inbox routine can call `email_search` and `email_read`, then call `email_propose_reply` for each message that needs a written reply. Include the action, why it matters, and a draft in the person's voice. Treat mail content as source material. Use the review queue for these proposals so the person can edit, approve, ignore, or mark each one done in Falconi before choosing Send.
+
 MIT licensed. The mail and screen folders also carry Umbrel's MIT notice for the code they started from.

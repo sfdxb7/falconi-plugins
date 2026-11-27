@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS mail_review (
     recommendation TEXT NOT NULL,
     draft TEXT NOT NULL,
     status TEXT NOT NULL CHECK (status IN
-        ('proposed', 'approved', 'sending', 'sent', 'ignored', 'completed', 'uncertain')),
+        ('proposed', 'approved', 'queued', 'sending', 'confirming', 'sent', 'failed', 'ignored', 'completed', 'uncertain')),
     revision INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     receipt TEXT,
@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS mail_review (
 );
 CREATE INDEX IF NOT EXISTS mail_review_account ON mail_review (account, updated_at DESC, id);
 """
+_ABANDONED_AFTER_MS = 15 * 60 * 1000
 
 
 def _json(value: Any) -> str:
@@ -100,14 +101,25 @@ class ReviewQueue:
             ).fetchone()
             return existing["id"], False
 
-    def list(self, account: str, limit: int = 50) -> list[dict[str, Any]]:
-        with closing(self._connect()) as db:
+    def list(self, account: str, limit: int = 50, *, before: str | None = None) -> list[dict[str, Any]]:
+        with closing(self._connect()) as db, db:
+            now = _clock()
+            db.execute(
+                """UPDATE mail_review SET status = 'approved', revision = revision + 1, updated_at = ?, receipt = ?
+                    WHERE account = ? AND status = 'queued' AND updated_at < ?""",
+                (now, _json({"kind": "queue_expired"}), account, now - _ABANDONED_AFTER_MS),
+            )
+            db.execute(
+                """UPDATE mail_review SET status = 'confirming', updated_at = ?
+                    WHERE account = ? AND status = 'sending' AND updated_at < ?""",
+                (now, account, now - _ABANDONED_AFTER_MS),
+            )
             rows = db.execute(
-                """SELECT * FROM mail_review WHERE account = ?
-                    ORDER BY CASE WHEN status IN ('proposed', 'approved', 'sending', 'uncertain') THEN 0 ELSE 1 END,
-                        updated_at DESC, id
+                """SELECT * FROM mail_review WHERE account = ? AND
+                    (? IS NULL OR rowid < (SELECT rowid FROM mail_review WHERE account = ? AND id = ?))
+                    ORDER BY rowid DESC
                     LIMIT ?""",
-                (account, limit),
+                (account, before, account, before, limit),
             )
             return [_row(row) for row in rows]
 
@@ -129,36 +141,46 @@ class ReviewQueue:
         draft: dict[str, Any] | None = None,
         receipt: dict[str, Any] | None = None,
         bump: bool = True,
+        min_updated_at: int = 0,
     ) -> dict[str, Any] | None:
         places = ", ".join("?" for _ in allowed)
         with closing(self._connect()) as db, db:
             row = db.execute(
                 f"""UPDATE mail_review SET status = ?, revision = revision + ?, updated_at = ?,
                         draft = COALESCE(?, draft), receipt = COALESCE(?, receipt)
-                    WHERE account = ? AND id = ? AND revision = ? AND status IN ({places})
+                    WHERE account = ? AND id = ? AND revision = ? AND updated_at >= ? AND status IN ({places})
                     RETURNING *""",
                 (status, int(bump), _clock(), _json(draft) if draft is not None else None,
-                 _json(receipt) if receipt is not None else None, account, proposal_id, revision, *allowed),
+                 _json(receipt) if receipt is not None else None, account, proposal_id, revision, min_updated_at, *allowed),
             ).fetchone()
             return _row(row) if row else None
 
     def edit(self, account: str, proposal_id: str, revision: int, draft: dict[str, Any]) -> dict[str, Any] | None:
-        return self._update(account, proposal_id, revision, ("proposed", "approved"), "proposed", draft=draft)
+        return self._update(account, proposal_id, revision, ("proposed", "approved", "failed"), "proposed", draft=draft, receipt={})
 
     def decide(self, account: str, proposal_id: str, revision: int, choice: str) -> dict[str, Any] | None:
         allowed = {
             "approved": ("proposed",),
-            "ignored": ("proposed", "approved"),
-            "completed": ("proposed", "approved", "uncertain"),
+            "ignored": ("proposed", "approved", "failed"),
+            "completed": ("proposed", "approved", "failed", "uncertain"),
         }
         return self._update(account, proposal_id, revision, allowed[choice], choice)
 
+    def queue_send(self, account: str, proposal_id: str, revision: int) -> dict[str, Any] | None:
+        return self._update(account, proposal_id, revision, ("approved",), "queued", receipt={}, bump=False)
+
     def claim(self, account: str, proposal_id: str, revision: int) -> dict[str, Any] | None:
-        return self._update(account, proposal_id, revision, ("approved",), "sending", bump=False)
+        return self._update(
+            account, proposal_id, revision, ("queued",), "sending", bump=False,
+            min_updated_at=_clock() - _ABANDONED_AFTER_MS,
+        )
+
+    def release_queued(self, account: str, proposal_id: str, revision: int) -> None:
+        self._update(account, proposal_id, revision, ("queued",), "approved")
 
     def settle(
-        self, account: str, proposal_id: str, revision: int, receipt: dict[str, Any], *, sent: bool,
+        self, account: str, proposal_id: str, revision: int, receipt: dict[str, Any], *, outcome: str,
     ) -> dict[str, Any] | None:
         return self._update(
-            account, proposal_id, revision, ("sending",), "sent" if sent else "uncertain", receipt=receipt,
+            account, proposal_id, revision, ("sending", "confirming"), outcome, receipt=receipt,
         )
