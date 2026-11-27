@@ -1,5 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import sqlite3
+from contextlib import closing
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
@@ -195,8 +197,87 @@ with queue.delivery_lock(sys.argv[3]) as acquired:
         ctx = MagicMock()
         register(ctx)
         tools = {call.kwargs["name"] for call in ctx.register_tool.call_args_list}
-        self.assertEqual(tools, {"email_search", "email_read", "email_draft", "email_send", "email_propose_reply"})
+        self.assertEqual(tools, {
+            "email_search", "email_read", "email_draft", "email_send", "email_propose_reply", "email_propose_action",
+        })
         ctx.register_rpc.assert_not_called()
+
+    def test_action_items_require_opt_in_before_paging(self):
+        older, _ = self.propose()
+        action, _ = self.queue.propose("mailbox", "action", self.source, "Choose a new date", None)
+        newer, _ = self.queue.propose("mailbox", "newer", self.source, "New reply", self.draft)
+        self.assertEqual([item["id"] for item in self.queue.list("mailbox", limit=2)], [newer, older])
+        page = self.queue.list("mailbox", limit=2, include_actions=True)
+        self.assertEqual([item["id"] for item in page], [newer, action])
+        self.assertIsNone(page[1]["draft"])
+        self.assertEqual([item["id"] for item in self.queue.list("mailbox", before=action, include_actions=True)], [older])
+        # These are the 1.3 dashboard's account selectors, including after a downgrade.
+        with closing(sqlite3.connect(self.queue.path)) as db, db:
+            rows = db.execute("SELECT id FROM mail_review WHERE account = ? ORDER BY rowid DESC", ("mailbox",))
+            self.assertEqual(list(rows), [(newer,), (older,)])
+            approve = db.execute(
+                """UPDATE mail_review SET status = 'approved'
+                    WHERE account = ? AND id = ? AND revision = 1 AND status = 'proposed'""",
+                ("mailbox", action),
+            )
+            self.assertEqual(approve.rowcount, 0)
+
+    def test_legacy_insert_cannot_reopen_a_completed_recommendation(self):
+        action, _ = self.queue.propose("mailbox", "source", self.source, "Choose a new date", None)
+        self.queue.decide("mailbox", action, 1, "completed")
+        with closing(sqlite3.connect(self.queue.path)) as db, db:
+            # The released reply-only writer uses this INSERT followed by its account lookup.
+            for legacy_id in ("first-legacy-attempt", "second-legacy-attempt"):
+                result = db.execute(
+                    """INSERT INTO mail_review (id, account, source_key, source, recommendation, draft, status,
+                        revision, updated_at) VALUES (?, 'mailbox', 'source', '{}', 'Reply', '{}', 'proposed', 1, 1)
+                        ON CONFLICT(account, source_key) DO NOTHING""",
+                    (legacy_id,),
+                )
+                self.assertEqual(result.rowcount, 0)
+                legacy = db.execute(
+                    "SELECT id, status, recommendation FROM mail_review WHERE account = 'mailbox' AND source_key = 'source'",
+                ).fetchone()
+                self.assertEqual(legacy, ("first-legacy-attempt", "completed", ""))
+        self.assertEqual(self.queue.list("mailbox"), [])
+        self.assertIsNone(self.queue.get("mailbox", "first-legacy-attempt"))
+        items = self.queue.list("mailbox", include_actions=True)
+        self.assertEqual([(item["id"], item["status"]) for item in items], [(action, "completed")])
+        self.assertEqual(self.propose(), (action, False))
+
+    def test_action_items_keep_the_decision_and_cannot_become_a_reply(self):
+        account = mail.Account("me@example.test", "fixture", "imap.example.test", "smtp.example.test")
+        scope = review_api._scope(account)
+        with patch.object(review_api, "_queue", return_value=self.queue), \
+                patch.object(mail, "saved_account", return_value=account), \
+                patch.object(mail, "open_mailbox") as mailbox, \
+                patch.object(review_api._delivery, "submit") as deliver:
+            box = mailbox.return_value.__enter__.return_value
+            box.headers_of.return_value = {
+                "reply_address": "", "message_id": "<announcement@example.test>", "from": [],
+                "subject": "Office closure", "date": None,
+            }
+            proposal = review_api.propose_action(account, {"source_id": "INBOX:31", "recommendation": "Choose a new date"})
+            self.assertTrue(proposal["created"])
+            self.assertEqual(review_api.list_proposals({})["items"], [])
+            visible = review_api.list_proposals({"include_actions": True})
+            self.assertIn("email_propose_action", visible["starter"]["prompt"])
+            item = visible["items"][0]
+            revision = {"id": item["id"], "revision": item["revision"]}
+            self.assertEqual(item["source"]["subject"], "Office closure")
+            self.assertIsNone(item["draft"])
+            self.assertIsNone(self.queue.get("different mailbox", item["id"]))
+            self.assertIsNone(self.queue.decide("different mailbox", item["id"], item["revision"], "completed"))
+            self.assertIsNone(self.queue.edit(scope, item["id"], item["revision"], self.draft))
+            self.assertEqual(review_api.edit_proposal({**revision, **self.draft}), {"ok": False, "reason": "changed"})
+            self.assertEqual(review_api.decide_proposal({**revision, "choice": "approved"}), {"ok": False, "reason": "changed"})
+            self.assertEqual(review_api.send_proposals({"items": [revision]}), {"items": [{"id": item["id"], "started": False}]})
+            deliver.assert_not_called()
+            decision = review_api.decide_proposal({**revision, "choice": "completed"})
+            self.assertEqual(decision["item"]["status"], "completed")
+            retried = review_api.propose_action(account, {"source_id": "Other:91", "recommendation": "Retry"})
+            self.assertEqual(retried, {"id": item["id"], "created": False})
+            self.assertEqual(self.queue.get(scope, item["id"])["recommendation"], "Choose a new date")
 
     def test_proposal_uses_actual_mail_headers_and_an_edit_leaves_the_recipient_intact(self):
         account = mail.Account("me@example.test", "fixture", "imap.example.test", "smtp.example.test")

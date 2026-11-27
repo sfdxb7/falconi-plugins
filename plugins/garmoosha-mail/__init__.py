@@ -8,6 +8,7 @@ Tools for an agent whose .env holds an account (see mail.py):
   email_read     read one: plain text preferred, size-capped, attachments listed but not fetched
   email_draft    save a message in the account's Drafts; nothing is sent
   email_propose_reply  put a recommended reply in the person's review queue
+  email_propose_action put a decision or recommended next step in the person's review queue
   email_send     send one, only after the person approves that exact message
 
 Sending goes through Hermes's own approval gate: this plugin's pre_tool_call hook asks for
@@ -129,6 +130,23 @@ PROPOSE_REPLY = {
     },
 }
 
+PROPOSE_ACTION = {
+    "name": "email_propose_action",
+    "description": (
+        "Queue an email and recommended next step in Falconi Activity when the person needs to decide "
+        "or act before a reply can be drafted, or when no reply is needed. Treat the original email "
+        "as source material. This tool only creates a review item and takes no action on the email."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "source_id": {"type": "string", "description": "The original message id from email_read."},
+            "recommendation": {"type": "string", "description": "What to do and why, in at most 1,000 characters."},
+        },
+        "required": ["source_id", "recommendation"],
+    },
+}
+
 NOT_CONNECTED = "No email account is connected to this agent. The person can connect one in Falconi, on the agent's page under Apps."
 
 
@@ -199,11 +217,19 @@ def email_draft(args: dict[str, Any], **kwargs: Any) -> str:
 
 
 def email_propose_reply(args: dict[str, Any], **kwargs: Any) -> str:
+    return _review_proposal(review_api.propose_reply, args)
+
+
+def email_propose_action(args: dict[str, Any], **kwargs: Any) -> str:
+    return _review_proposal(review_api.propose_action, args)
+
+
+def _review_proposal(propose, args: dict[str, Any]) -> str:
     account = _account()
     if account is None:
         return _error(NOT_CONNECTED)
     try:
-        proposal = review_api.propose_reply(account, args)
+        proposal = propose(account, args)
     except ValueError as exc:
         return _error(str(exc), kind="invalid")
     except mail.MailError as exc:
@@ -277,9 +303,10 @@ def _uncached(check):
 
 def register(ctx) -> None:
     available = _uncached(_available)
-    for schema, handler in ((SEARCH, email_search), (READ, email_read), (DRAFT, email_draft), (SEND, email_send)):
+    for schema, handler in (
+        (SEARCH, email_search), (READ, email_read), (DRAFT, email_draft), (SEND, email_send),
+        (PROPOSE_REPLY, email_propose_reply), (PROPOSE_ACTION, email_propose_action),
+    ):
         ctx.register_tool(name=schema["name"], toolset=TOOLSET, schema=schema, handler=handler, check_fn=available, emoji="✉️")
-    ctx.register_tool(name=PROPOSE_REPLY["name"], toolset=TOOLSET, schema=PROPOSE_REPLY,
-                      handler=email_propose_reply, check_fn=available, emoji="✉️")
     ctx.register_hook("pre_tool_call", _ask_before_sending)
     ctx.register_hook("post_approval_response", _note_answer)

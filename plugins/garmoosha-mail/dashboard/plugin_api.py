@@ -31,9 +31,10 @@ router = APIRouter()
 
 def _package() -> str:
     # Hermes loads dashboard routers by path, outside the plugin's package.
-    # Give this installed copy a package so both handlers share the mail types.
+    # Give each installation and release a package so a reload uses the current mail types.
     root = Path(__file__).resolve().parent.parent
-    name = "garmoosha_mail_dashboard_" + sha256(str(root).encode()).hexdigest()[:16]
+    identity = str(root).encode() + b"\0" + (root / "plugin.yaml").read_bytes()
+    name = "garmoosha_mail_dashboard_" + sha256(identity).hexdigest()[:16]
     package = ModuleType(name)
     package.__path__ = [str(root)]
     sys.modules.setdefault(name, package)
@@ -168,8 +169,8 @@ async def _review_action(handler, body: dict[str, Any]):
 
 
 @router.get("/review")
-async def list_reviews(before: Optional[str] = None):
-    return await _review_action(review.list_proposals, {"before": before})
+async def list_reviews(before: Optional[str] = None, include_actions: bool = False):
+    return await _review_action(review.list_proposals, {"before": before, "include_actions": include_actions})
 
 
 @router.get("/review/source")
