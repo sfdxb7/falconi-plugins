@@ -1202,7 +1202,7 @@ class Mailbox:
         """What a reply needs from the message it answers."""
         raw, uid = self.locate(message_id)
         self.select(raw)
-        rows = self.fetch([uid], "(UID BODY.PEEK[HEADER.FIELDS (FROM REPLY-TO SUBJECT MESSAGE-ID REFERENCES)])")
+        rows = self.fetch([uid], "(UID BODY.PEEK[HEADER.FIELDS (FROM REPLY-TO SUBJECT MESSAGE-ID REFERENCES DATE)])")
         if not rows:
             raise MailError("not_found", "imap", "That message isn't there any more.")
         h = BytesHeaderParser(policy=DEFAULT_POLICY).parsebytes(_header_bytes(rows[0]))
@@ -1216,6 +1216,8 @@ class Mailbox:
             "message_id": _one_line(h.get("Message-ID", "")),
             "references": _one_line(h.get("References", "")),
             "reply_address": formataddr((name, address)) if name and address else address,
+            "from": people(h.get("From", "")),
+            "date": iso_date(h.get("Date")),
         }
 
     def read(self, message_id: str) -> dict[str, Any]:

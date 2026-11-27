@@ -6,6 +6,7 @@ provides_tools:
   - email_search
   - email_read
   - email_draft
+  - email_propose_reply
   - email_send
 provides_hooks:
   - pre_tool_call

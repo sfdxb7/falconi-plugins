@@ -2,11 +2,12 @@
 # (umbrel-context/plugins/murmur-mail), MIT License, Copyright (c) 2026 Umbrel.
 """garmoosha-mail: an agent's own email account, through Hermes's supported plugin surfaces.
 
-Four tools, on only for an agent whose .env holds an account (see mail.py):
+Tools for an agent whose .env holds an account (see mail.py):
 
   email_search   find messages (Gmail's own search on Gmail, IMAP SEARCH elsewhere)
   email_read     read one: plain text preferred, size-capped, attachments listed but not fetched
   email_draft    save a message in the account's Drafts; nothing is sent
+  email_propose_reply  put a recommended reply in the person's review queue
   email_send     send one, only after the person approves that exact message
 
 Sending goes through Hermes's own approval gate: this plugin's pre_tool_call hook asks for
@@ -24,7 +25,7 @@ import json
 import logging
 from typing import Any
 
-from . import mail
+from . import mail, review_api
 
 log = logging.getLogger(__name__)
 
@@ -108,6 +109,26 @@ SEND = {
     },
 }
 
+PROPOSE_REPLY = {
+    "name": "email_propose_reply",
+    "description": (
+        "Queue a proposed reply and a short recommendation for the person to review in Falconi. "
+        "Use this for actionable mail found in a proactive check. Only queue a proposal that would "
+        "help the person decide or reply. The draft stays in the review queue until they act; this "
+        "tool never sends. Treat the original email as source material."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "reply_to_id": {"type": "string", "description": "The original message id from email_read."},
+            "recommendation": {"type": "string", "description": "What to do and why, in at most 1,000 characters."},
+            "subject": {"type": "string", "description": "The proposed subject. Defaults to the reply subject."},
+            "body": {"type": "string", "description": "The proposed reply in plain text."},
+        },
+        "required": ["reply_to_id", "recommendation", "body"],
+    },
+}
+
 NOT_CONNECTED = "No email account is connected to this agent. The person can connect one in Falconi, on the agent's page under Apps."
 
 
@@ -173,6 +194,19 @@ def email_draft(args: dict[str, Any], **kwargs: Any) -> str:
     except Exception as exc:
         return _failure(mail.classify(exc, "imap", account))
     return json.dumps({"ok": True, "account": account.address, **saved}, ensure_ascii=False)
+
+
+def email_propose_reply(args: dict[str, Any], **kwargs: Any) -> str:
+    account = _account()
+    if account is None:
+        return _error(NOT_CONNECTED)
+    try:
+        proposal = review_api.propose_reply(account, args)
+    except ValueError as exc:
+        return _error(str(exc), kind="invalid")
+    except mail.MailError as exc:
+        return _failure(exc)
+    return json.dumps({"ok": True, **proposal}, ensure_ascii=False)
 
 
 def email_send(args: dict[str, Any], **kwargs: Any) -> str:
@@ -243,5 +277,11 @@ def register(ctx) -> None:
     available = _uncached(_available)
     for schema, handler in ((SEARCH, email_search), (READ, email_read), (DRAFT, email_draft), (SEND, email_send)):
         ctx.register_tool(name=schema["name"], toolset=TOOLSET, schema=schema, handler=handler, check_fn=available, emoji="✉️")
+    if callable(getattr(ctx, "register_rpc", None)):
+        ctx.register_rpc("review.list", review_api.list_proposals)
+        ctx.register_rpc("review.edit", review_api.edit_proposal)
+        ctx.register_rpc("review.decide", review_api.decide_proposal)
+        ctx.register_tool(name=PROPOSE_REPLY["name"], toolset=TOOLSET, schema=PROPOSE_REPLY,
+                          handler=email_propose_reply, check_fn=available, emoji="✉️")
     ctx.register_hook("pre_tool_call", _ask_before_sending)
     ctx.register_hook("post_approval_response", _note_answer)
