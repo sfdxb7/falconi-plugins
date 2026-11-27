@@ -1,5 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import subprocess
+import sys
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import MagicMock, patch
@@ -93,12 +95,43 @@ class ReviewTests(unittest.TestCase):
             approved = self.queue.decide("mailbox", proposal_id, 1, "approved")
             revision = approved["revision"]
             self.queue.queue_send("mailbox", proposal_id, revision)
-            self.queue.claim("mailbox", proposal_id, revision)
-            clock.return_value += review._ABANDONED_AFTER_MS + 1
-            self.assertEqual(self.queue.list("mailbox")[0]["status"], "confirming")
-            self.assertIsNone(self.queue.decide("mailbox", proposal_id, revision, "completed"))
-            late = self.queue.settle("mailbox", proposal_id, revision, {"message_id": "fixture"}, outcome="sent")
-            self.assertEqual(late["status"], "sent")
+            with self.queue.delivery_lock(proposal_id) as acquired:
+                self.assertTrue(acquired)
+                self.queue.claim("mailbox", proposal_id, revision)
+                clock.return_value += review._ABANDONED_AFTER_MS + 1
+                self.assertEqual(self.queue.list("mailbox")[0]["status"], "confirming")
+                self.assertIsNone(self.queue.decide("mailbox", proposal_id, revision, "completed"))
+                late = self.queue.settle("mailbox", proposal_id, revision, {"message_id": "fixture"}, outcome="sent")
+                self.assertEqual(late["status"], "sent")
+
+    def test_process_exit_after_claim_becomes_uncertain_without_resending(self):
+        proposal_id, _ = self.propose()
+        revision = self.queue.decide("mailbox", proposal_id, 1, "approved")["revision"]
+        self.queue.queue_send("mailbox", proposal_id, revision)
+        script = """
+from importlib import import_module
+from pathlib import Path
+import sys
+queue = import_module(sys.argv[1]).ReviewQueue(Path(sys.argv[2]))
+with queue.delivery_lock(sys.argv[3]) as acquired:
+    assert acquired and queue.claim("mailbox", sys.argv[3], int(sys.argv[4]))
+    print("claimed", flush=True)
+    sys.stdin.read()
+"""
+        with subprocess.Popen(
+            [sys.executable, "-c", script, review.__name__, self.home.name, proposal_id, str(revision)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+        ) as worker:
+            try:
+                self.assertEqual(worker.stdout.readline().strip(), "claimed")
+                self.assertEqual(self.queue.list("mailbox")[0]["status"], "sending")
+            finally:
+                worker.kill()
+                worker.wait(timeout=5)
+        recovered = self.queue.list("mailbox")[0]
+        self.assertEqual((recovered["status"], recovered["receipt"]["kind"]), ("uncertain", "worker_stopped"))
+        self.assertIsNone(self.queue.queue_send("mailbox", proposal_id, recovered["revision"]))
+        self.assertEqual(self.queue.decide("mailbox", proposal_id, recovered["revision"], "completed")["status"], "completed")
 
     def test_another_mailbox_cannot_read_or_change_a_proposal(self):
         proposal_id, _ = self.propose()

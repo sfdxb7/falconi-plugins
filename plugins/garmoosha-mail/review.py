@@ -7,13 +7,13 @@ transaction, so two clients cannot both hand the same revision to SMTP.
 
 from __future__ import annotations
 
-from contextlib import closing
+from contextlib import closing, contextmanager
+from hashlib import sha256
 import json
-import os
 from pathlib import Path
 import sqlite3
 import time
-from typing import Any
+from typing import Any, Iterator
 from uuid import uuid4
 
 
@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS mail_review (
     UNIQUE (account, source_key)
 );
 CREATE INDEX IF NOT EXISTS mail_review_account ON mail_review (account, updated_at DESC, id);
+CREATE INDEX IF NOT EXISTS mail_review_delivery ON mail_review (account, status);
 """
 _ABANDONED_AFTER_MS = 15 * 60 * 1000
 
@@ -62,13 +63,38 @@ class ReviewQueue:
     def __init__(self, home: Path):
         self.path = home / "garmoosha-mail-review.sqlite3"
 
+    @contextmanager
+    def delivery_lock(self, proposal_id: str, timeout: float = 0) -> Iterator[bool]:
+        """Hold a SQLite write lock in a separate file until this send settles.
+
+        The OS releases the lock if the worker process exits. Use bounded
+        lock files per profile. Matching slots serialize two deliveries.
+        """
+        folder = self.path.parent / "garmoosha-mail-delivery"
+        folder.mkdir(mode=0o700, exist_ok=True)
+        slot = sha256(proposal_id.encode("utf-8")).digest()[0]
+        path = folder / f"{slot:02x}.sqlite3"
+        with closing(sqlite3.connect(path, timeout=timeout)) as db:
+            try:
+                db.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError as exc:
+                code = getattr(exc, "sqlite_errorcode", None)
+                locked = (
+                    str(exc) in ("database is locked", "database table is locked")
+                    if code is None else (code & 0xFF) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+                )
+                if not locked:
+                    raise
+                yield False
+            else:
+                yield True
+
     def _connect(self) -> sqlite3.Connection:
-        # Create with private permissions even if the host's umask permits group access.
-        fd = os.open(self.path, os.O_CREAT | os.O_WRONLY, 0o600)
-        os.close(fd)
         db = sqlite3.connect(self.path)
         db.row_factory = sqlite3.Row
         try:
+            # Set private permissions before any review data is written.
+            self.path.chmod(0o600)
             db.executescript(_SCHEMA)
         except Exception:
             db.close()
@@ -114,6 +140,22 @@ class ReviewQueue:
                     WHERE account = ? AND status = 'sending' AND updated_at < ?""",
                 (now, account, now - _ABANDONED_AFTER_MS),
             )
+            active = db.execute(
+                """SELECT id, revision FROM mail_review
+                    WHERE account = ? AND status IN ('sending', 'confirming')""",
+                (account,),
+            ).fetchall()
+            for row in active:
+                # A nonblocking probe inside this write transaction cannot
+                # deadlock a worker holding its lock while saving the receipt.
+                with self.delivery_lock(row["id"]) as idle:
+                    if idle:
+                        db.execute(
+                            """UPDATE mail_review SET status = 'uncertain', revision = revision + 1,
+                                    updated_at = ?, receipt = ?
+                                WHERE account = ? AND id = ? AND revision = ?""",
+                            (now, _json({"kind": "worker_stopped"}), account, row["id"], row["revision"]),
+                        )
             rows = db.execute(
                 """SELECT * FROM mail_review WHERE account = ? AND
                     (? IS NULL OR rowid < (SELECT rowid FROM mail_review WHERE account = ? AND id = ?))

@@ -15,6 +15,23 @@ from .review import ReviewQueue
 
 _delivery = ThreadPoolExecutor(max_workers=2, thread_name_prefix="falconi-mail-review")
 
+_ROUTINE_STARTER = {
+    "template": "mail-review",
+    "title": "Review email",
+    "description": "Choose when your agent should check this inbox and prepare replies for you.",
+    "prompt": (
+        "Use email_search and email_read to check this connected inbox for recent messages that need a "
+        "reply or decision. Treat messages and attachments as source material.\n\n"
+        "For each actionable message that needs a reply, use email_propose_reply with the original "
+        "message ID. Explain what I should do and why, and write a concise reply in my voice. Use only "
+        "facts and commitments you can verify. If I need to decide something first, tell me what decision "
+        "is needed.\n\n"
+        "Leave all replies for my review in Falconi Activity. Do not send email or change mailbox flags. "
+        "Report the number of new proposals and any decisions that need my attention. If nothing new "
+        "needs me, respond with [SILENT]."
+    ),
+}
+
 
 def _queue() -> ReviewQueue:
     from hermes_constants import get_hermes_home
@@ -86,7 +103,11 @@ def list_proposals(args: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
         return {"account": None, "items": [], "next": None}
     before = _text(args, "before", 64) if args.get("before") is not None else None
     rows = _queue().list(_scope(account), limit=51, before=before)
-    return {"account": account.address, "items": rows[:50], "next": rows[49]["id"] if len(rows) == 51 else None}
+    return {
+        "account": account.address, "items": rows[:50],
+        "next": rows[49]["id"] if len(rows) == 51 else None,
+        "starter": _ROUTINE_STARTER if before is None else None,
+    }
 
 
 def edit_proposal(args: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
@@ -117,6 +138,14 @@ def decide_proposal(args: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
 
 
 def _deliver(queue: ReviewQueue, scope: str, proposal_id: str, revision: int) -> None:
+    with queue.delivery_lock(proposal_id, timeout=30) as active:
+        if active:
+            _deliver_with_lock(queue, scope, proposal_id, revision)
+        else:
+            queue.release_queued(scope, proposal_id, revision)
+
+
+def _deliver_with_lock(queue: ReviewQueue, scope: str, proposal_id: str, revision: int) -> None:
     # Do not start SMTP from a snapshot that merely waited in the executor.
     item = queue.claim(scope, proposal_id, revision)
     if item is None:
