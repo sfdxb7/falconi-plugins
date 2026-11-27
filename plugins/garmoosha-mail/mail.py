@@ -139,7 +139,7 @@ def _flag(value: str, default: bool) -> bool:
     return default
 
 
-def account_from(values: dict[str, str]) -> tuple[Optional[Account], list[str]]:
+def account_from(values: dict[str, Any]) -> tuple[Optional[Account], list[str]]:
     """The account in ``values`` (keyed by short name: ADDRESS, PASSWORD…), or None and what's missing."""
     if values.get(WORKSPACE_GMAIL):
         linked = workspace_binding(values[WORKSPACE_GMAIL])
@@ -180,8 +180,6 @@ def account_from(values: dict[str, str]) -> tuple[Optional[Account], list[str]]:
 def saved_values(secrets: dict[str, str]) -> dict[str, str]:
     """The agent's saved settings by short name, from its secret mapping."""
     out: dict[str, str] = {}
-    if secrets.get(PREFIX + WORKSPACE_GMAIL):
-        out[WORKSPACE_GMAIL] = str(secrets[PREFIX + WORKSPACE_GMAIL])
     for key in REQUIRED + OPTIONAL:
         for prefix in (PREFIX, LEGACY_PREFIX):
             value = secrets.get(prefix + key)
@@ -214,17 +212,10 @@ def current_agent() -> str:
 
 def is_inherited(values: dict[str, str], agent: str) -> bool:
     """Settings that belong to another agent (a copy Hermes made when this agent was created)."""
-    if values.get(WORKSPACE_GMAIL):
-        binding = workspace_binding(values[WORKSPACE_GMAIL])
-        return binding is None or binding[0] != agent
     return bool(values) and str(values.get("AGENT") or "").strip() != agent
 
 
-def workspace_binding(value: str) -> tuple[str, str] | None:
-    try:
-        pair = json.loads(value)
-    except (ValueError, TypeError):
-        return None
+def workspace_binding(pair: Any) -> tuple[str, str] | None:
     if not isinstance(pair, list) or len(pair) != 2:
         return None
     agent, address = pair
@@ -233,11 +224,24 @@ def workspace_binding(value: str) -> tuple[str, str] | None:
     return agent, address
 
 
-def saved_account() -> Optional[Account]:
-    """This agent's own account, from its .env through Hermes's profile scope, or None."""
+def active_account_settings() -> tuple[dict[str, Any], bool]:
+    from hermes_cli.config import load_config_readonly
+
+    agent = current_agent()
     values = saved_values(profile_secrets())
-    if is_inherited(values, current_agent()):
-        return None
+    inherited = is_inherited(values, agent)
+    plugins = (load_config_readonly() or {}).get("plugins") or {}
+    entries = plugins.get("entries") or {}
+    settings = (entries.get("garmoosha-mail") or {}).get("settings") or {}
+    binding = workspace_binding(settings.get("workspace_gmail"))
+    if binding and binding[0] == agent:
+        return {WORKSPACE_GMAIL: list(binding)}, False
+    return ({} if inherited else values), inherited
+
+
+def saved_account() -> Optional[Account]:
+    """This agent's own account, scoped by Hermes."""
+    values, _ = active_account_settings()
     return account_from(values)[0]
 
 

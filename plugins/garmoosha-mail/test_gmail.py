@@ -1,8 +1,9 @@
 import base64
 from email.parser import BytesParser
-import json
 from pathlib import Path
+import sys
 from tempfile import TemporaryDirectory
+from types import ModuleType
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -33,6 +34,7 @@ class WorkspaceMailTests(unittest.TestCase):
         self.account = mail.Account("me@example.test", "", "", "", provider="gmail", workspace=True)
         self.session = MagicMock()
         self.session.__enter__.return_value = self.session
+        self.session.credentials.scopes = [gmail._GOOGLE + "gmail.modify"]
         self.identity = self.account.address
         self.source = provider_message()
         self.requests = []
@@ -59,7 +61,7 @@ class WorkspaceMailTests(unittest.TestCase):
         if path == "/messages/send":
             return {"id": "sent"}
         if path == "/drafts":
-            return {"id": "saved-draft"}
+            return {"id": "saved-draft", "message": {"id": "draftMessage"}}
         self.fail(f"Unexpected Gmail route {path}")
 
     def proposal(self):
@@ -69,10 +71,18 @@ class WorkspaceMailTests(unittest.TestCase):
         return self.queue.get(review_api._scope(self.account), answer["id"])
 
     def test_binding_belongs_to_its_profile_and_does_not_reuse_imap_approvals(self):
-        values = mail.saved_values({mail.PREFIX + mail.WORKSPACE_GMAIL: json.dumps(["work", self.account.address])})
-        self.assertFalse(mail.is_inherited(values, "work"))
-        self.assertTrue(mail.is_inherited(values, "personal"))
-        self.assertEqual(mail.account_from(values), (self.account, []))
+        config = ModuleType("hermes_cli.config")
+        config.load_config_readonly = lambda: {
+            "plugins": {"entries": {"garmoosha-mail": {"settings": {"workspace_gmail": ["work", self.account.address]}}}},
+        }
+        with patch.dict(sys.modules, {config.__name__: config}), \
+                patch.object(mail, "current_agent", side_effect=("work", "personal")), \
+                patch.object(mail, "profile_secrets", return_value={}):
+            work, inherited = mail.active_account_settings()
+            self.assertFalse(inherited)
+            self.assertEqual(mail.account_from(work), (self.account, []))
+            personal, _ = mail.active_account_settings()
+            self.assertFalse(personal)
         original = mail.Account(self.account.address, "fixture", "imap.example.test", "smtp.example.test")
         draft = mail.draft_from_args({"to": ["reply@example.test"], "body": "Test"})
         self.assertNotEqual(review_api._scope(self.account), review_api._scope(original))
@@ -81,6 +91,7 @@ class WorkspaceMailTests(unittest.TestCase):
     def test_source_and_search_are_read_only_and_mail_is_plain_text(self):
         with mail.open_mailbox(self.account) as box:
             results = box.search("newer_than:1d")
+            self.assertEqual(results["folder"], "All Mail")
             self.assertTrue(results["messages"][0]["unread"])
         item = self.proposal()
         self.assertEqual(item["draft"]["to"], ["reply@example.test"])
@@ -88,6 +99,26 @@ class WorkspaceMailTests(unittest.TestCase):
         self.assertEqual(preview, {"ok": True, "body": "Original handoff", "truncated": False, "attachments": ["agenda.pdf"]})
         self.assertTrue(all(verb == "GET" for verb, _, _ in self.requests))
         self.assertTrue(any(params.get("params", {}).get("q") == "newer_than:1d" for _, _, params in self.requests))
+
+    def test_search_folders_translate_to_gmail_labels_or_archive_filter(self):
+        with mail.open_mailbox(self.account) as box:
+            for folder in ("", "drafts", "junk", "trash", "archive"):
+                box.search("Handoff", folder)
+        requests = [values["params"] for _, path, values in self.requests if path == "/messages"]
+        self.assertNotIn("labelIds", requests[0])
+        self.assertEqual(requests[1]["labelIds"], "DRAFT")
+        self.assertEqual((requests[2]["labelIds"], requests[2]["includeSpamTrash"]), ("SPAM", "true"))
+        self.assertEqual((requests[3]["labelIds"], requests[3]["includeSpamTrash"]), ("TRASH", "true"))
+        self.assertEqual(requests[4]["q"], "in:archive Handoff")
+
+    def test_mailbox_drafts_need_compose_permission_and_return_the_message_id(self):
+        draft = mail.draft_from_args({"reply_to_id": "gmail:original", "body": "Friday works."})
+        self.session.credentials.scopes = [gmail._GOOGLE + "gmail.readonly", gmail._GOOGLE + "gmail.send"]
+        with self.assertRaisesRegex(mail.MailError, "email_propose_reply"):
+            mail.draft(self.account, draft)
+        self.assertFalse(any(method == "POST" for method, _, _ in self.requests))
+        self.session.credentials.scopes.append(gmail._GOOGLE + "gmail.compose")
+        self.assertEqual(mail.draft(self.account, draft)["id"], "gmail:draftMessage")
 
     def test_only_a_claimed_approval_sends_the_edited_reply_in_its_thread(self):
         item = self.proposal()

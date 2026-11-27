@@ -17,10 +17,15 @@ _BASE = "https://gmail.googleapis.com/gmail/v1/users/me"
 _GOOGLE = "https://www.googleapis.com/auth/"
 _FULL = "https://mail.google.com/"
 _READ_SCOPES = {_FULL, _GOOGLE + "gmail.modify", _GOOGLE + "gmail.readonly"}
-_SEND_SCOPES = {_FULL, _GOOGLE + "gmail.modify", _GOOGLE + "gmail.compose", _GOOGLE + "gmail.send"}
+_DRAFT_SCOPES = {_FULL, _GOOGLE + "gmail.modify", _GOOGLE + "gmail.compose"}
+_SEND_SCOPES = _DRAFT_SCOPES | {_GOOGLE + "gmail.send"}
 _HEADERS = ("From", "Reply-To", "To", "Cc", "Subject", "Date", "Message-ID", "References")
 _MESSAGE_ID = re.compile(r"gmail:([a-zA-Z0-9_-]{1,128})\Z")
 _RESPONSE_BYTES = 4 * 1024 * 1024
+_FOLDER_LABELS = {
+    "inbox": "INBOX", "sent": "SENT", "draft": "DRAFT", "drafts": "DRAFT", "trash": "TRASH",
+    "junk": "SPAM", "spam": "SPAM", "starred": "STARRED", "unread": "UNREAD", "important": "IMPORTANT",
+}
 
 
 def _token_path() -> Path:
@@ -212,11 +217,17 @@ class GmailMailbox:
 
     def search(self, query: str, which: str = "", limit: int = mail.SEARCH_LIMIT) -> dict[str, Any]:
         limit = max(1, min(mail.SEARCH_MAX, mail._int(limit) or mail.SEARCH_LIMIT))
-        folder = which.strip() or "INBOX"
+        folder = which.strip() or "All Mail"
         params: dict[str, Any] = {"maxResults": limit, "fields": "messages(id),nextPageToken,resultSizeEstimate"}
-        if folder.upper() in {"INBOX", "SENT", "DRAFT", "TRASH", "SPAM", "STARRED", "UNREAD", "IMPORTANT"}:
-            params["labelIds"] = folder.upper()
-        elif folder.casefold() not in {"all mail", "all", "[gmail]/all mail"}:
+        name = folder.casefold().removeprefix("[gmail]/")
+        label = _FOLDER_LABELS.get(name)
+        if label:
+            params["labelIds"] = label
+            if label in {"SPAM", "TRASH"}:
+                params["includeSpamTrash"] = "true"
+        elif name == "archive":
+            query = f"in:archive {query}"
+        elif name not in {"all mail", "all"}:
             query = f"label:{json.dumps(folder)} {query}"
         if query.strip():
             params["q"] = query.strip()
@@ -239,6 +250,8 @@ class GmailMailbox:
         return {"folder": folder, "total": response.get("resultSizeEstimate", len(messages)), "more": bool(response.get("nextPageToken")), "messages": messages}
 
     def write(self, draft: mail.Draft, *, send: bool, expected_source: str = "") -> dict[str, Any]:
+        if not send and not _DRAFT_SCOPES.intersection(self.session.credentials.scopes or []):
+            raise _oauth_error("invalid", "Gmail needs permission to create mailbox drafts. For a reply, use email_propose_reply to save it for approval in Falconi.")
         original = self.headers_of(draft.reply_to_id) if draft.reply_to_id else None
         if expected_source and (not original or mail.reply_source_digest(original) != expected_source):
             raise _oauth_error("source_changed", "The original email changed before sending.")
@@ -255,7 +268,8 @@ class GmailMailbox:
             receipt = {"sent": True, "saved_to": "Sent", "refused": []}
         else:
             result = _request(self.session, "POST", "/drafts", body={"message": body})
-            receipt = {"saved": True, "folder": "Drafts", "id": result.get("id")}
+            draft_id = (result.get("message") or {}).get("id")
+            receipt = {"saved": True, "folder": "Drafts", "id": f"gmail:{draft_id}" if draft_id else None}
         return {
             **receipt, "message_id": message["Message-ID"], "subject": str(message.get("Subject", "")),
             "to": mail._addressed(message, "To"), "cc": mail._addressed(message, "Cc"), "bcc": mail._addressed(message, "Bcc"),

@@ -74,12 +74,8 @@ def _enabled() -> bool:
     return on and not off
 
 
-def _saved() -> tuple[dict[str, str], bool]:
-    """This agent's saved settings, and whether they're a copy of another agent's."""
-    values = mail.saved_values(mail.profile_secrets())
-    if mail.is_inherited(values, mail.current_agent()):
-        return {}, True
-    return values, False
+def _saved() -> tuple[dict[str, Any], bool]:
+    return mail.active_account_settings()
 
 
 @router.get("/status")
