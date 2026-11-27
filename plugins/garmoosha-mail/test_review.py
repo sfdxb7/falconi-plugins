@@ -23,6 +23,68 @@ class ReviewTests(unittest.TestCase):
     def propose(self):
         return self.queue.propose("mailbox", "source", self.source, "Reply today", self.draft)
 
+    def test_pending_count_leaves_an_empty_profile_without_a_database(self):
+        self.assertEqual(self.queue.pending_count("mailbox"), 0)
+        self.assertFalse(self.queue.path.exists())
+
+    def test_pending_count_includes_all_actionable_rows_and_excludes_live_delivery(self):
+        for i in range(53):
+            self.queue.propose("mailbox", f"action-{i}", self.source, "Review", None)
+        self.queue.propose("other", "private", self.source, "Other mailbox", self.draft)
+
+        def reply(key):
+            item, _ = self.queue.propose("mailbox", key, self.source, "Reply", self.draft)
+            approved = self.queue.decide("mailbox", item, 1, "approved")
+            return item, approved["revision"]
+
+        closed, revision = reply("closed")
+        self.queue.decide("mailbox", closed, revision, "ignored")
+        reply("approved")
+        failed, revision = reply("failed")
+        self.queue.queue_send("mailbox", failed, revision)
+        self.queue.claim("mailbox", failed, revision)
+        self.queue.settle("mailbox", failed, revision, {}, outcome="failed")
+        expired, revision = reply("expired")
+        self.queue.queue_send("mailbox", expired, revision)
+        with closing(sqlite3.connect(self.queue.path)) as db, db:
+            db.execute("UPDATE mail_review SET updated_at = 0 WHERE id = ?", (expired,))
+        queued, revision = reply("queued")
+        self.queue.queue_send("mailbox", queued, revision)
+        sending, revision = reply("sending")
+        self.queue.queue_send("mailbox", sending, revision)
+        with self.queue.delivery_lock(sending) as locked:
+            self.assertTrue(locked)
+            self.queue.claim("mailbox", sending, revision)
+            self.assertEqual(self.queue.pending_count("mailbox"), 56)
+        self.assertEqual(self.queue.pending_count("mailbox"), 57)
+        self.assertEqual(self.queue.get("mailbox", sending)["status"], "uncertain")
+        self.assertEqual(self.queue.get("mailbox", expired)["status"], "approved")
+        self.assertEqual(self.queue.get("mailbox", queued)["status"], "queued")
+
+    def test_pending_count_reads_committed_rows_while_a_writer_is_reserved(self):
+        item, _ = self.queue.propose("mailbox", "source", self.source, "Review", None)
+        with closing(sqlite3.connect(self.queue.path)) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("UPDATE mail_review SET status = 'completed' WHERE id = ?", (item,))
+            self.assertEqual(self.queue.pending_count("mailbox"), 1)
+        self.assertEqual(self.queue.pending_count("mailbox"), 0)
+
+    def test_pending_summary_only_reports_the_current_scope_and_never_opens_mail(self):
+        account = mail.Account("me@example.test", "fixture", "imap.example.test", "smtp.example.test")
+        other = mail.Account("other@example.test", "fixture", "imap.example.test", "smtp.example.test")
+        self.queue.propose(review_api._scope(account), "first", self.source, "Review", None)
+        self.queue.propose(review_api._scope(other), "second", self.source, "Review", None)
+        self.queue.propose(review_api._scope(other), "third", self.source, "Review", self.draft)
+        with patch.object(review_api, "_queue", return_value=self.queue), \
+                patch.object(mail, "open_mailbox") as provider, \
+                patch.object(mail, "saved_account", return_value=account) as binding:
+            self.assertEqual(review_api.pending_summary({}), {"pending": 1})
+            binding.return_value = None
+            self.assertEqual(review_api.pending_summary({}), {"pending": 0})
+            binding.side_effect = [account, other]
+            self.assertEqual(review_api.pending_summary({}), {"pending": None})
+            provider.assert_not_called()
+
     def test_original_read_rejects_a_reused_uid_before_fetching_the_body(self):
         account = mail.Account("me@example.test", "fixture", "imap.example.test", "smtp.example.test")
         box = mail.Mailbox(account)

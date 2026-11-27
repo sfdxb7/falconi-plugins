@@ -157,38 +157,65 @@ class ReviewQueue:
         rows, _ = self.page(account, limit, before=before, include_actions=include_actions)
         return rows
 
+    def _recover_deliveries(self, db: sqlite3.Connection, account: str) -> None:
+        now = _clock()
+        db.execute(
+            """UPDATE mail_review SET status = 'approved', revision = revision + 1, updated_at = ?, receipt = ?
+                WHERE account = ? AND status = 'queued' AND updated_at < ?""",
+            (now, _json({"kind": "queue_expired"}), account, now - _ABANDONED_AFTER_MS),
+        )
+        db.execute(
+            """UPDATE mail_review SET status = 'confirming', updated_at = ?
+                WHERE account = ? AND status = 'sending' AND updated_at < ?""",
+            (now, account, now - _ABANDONED_AFTER_MS),
+        )
+        active = db.execute(
+            """SELECT id, revision FROM mail_review
+                WHERE account = ? AND status IN ('sending', 'confirming')""",
+            (account,),
+        ).fetchall()
+        for row in active:
+            # A nonblocking probe inside this write transaction cannot
+            # deadlock a worker holding its lock while saving the receipt.
+            with self.delivery_lock(row["id"]) as idle:
+                if idle:
+                    db.execute(
+                        """UPDATE mail_review SET status = 'uncertain', revision = revision + 1,
+                                updated_at = ?, receipt = ?
+                            WHERE account = ? AND id = ? AND revision = ?""",
+                        (now, _json({"kind": "worker_stopped"}), account, row["id"], row["revision"]),
+                    )
+
+    def pending_count(self, account: str) -> int:
+        """Count decisions in a local mailbox queue without loading message content."""
+        try:
+            self.path.stat()
+        except FileNotFoundError:
+            # Opening Waiting should not create queues for unused mailboxes.
+            return 0
+        accounts = (account, _action_account(account))
+        count = """SELECT COUNT(*) FROM mail_review WHERE account IN (?, ?)
+                    AND status IN ('proposed', 'approved', 'failed', 'uncertain')"""
+        with closing(sqlite3.connect(self.path.absolute().as_uri() + "?mode=ro", uri=True)) as db:
+            pending, recover = db.execute(
+                f"""SELECT ({count}), EXISTS (
+                    SELECT 1 FROM mail_review WHERE account = ? AND
+                        (status IN ('sending', 'confirming') OR (status = 'queued' AND updated_at < ?))
+                )""",
+                (*accounts, account, _clock() - _ABANDONED_AFTER_MS),
+            ).fetchone()
+        if not recover:
+            return pending
+        with closing(self._connect()) as db, db:
+            self._recover_deliveries(db, account)
+            return db.execute(count, accounts).fetchone()[0]
+
     def page(
         self, account: str, limit: int, *, before: str | None = None, include_actions: bool = False,
         active_only: bool = False, tracked: tuple[str, ...] = (),
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         with closing(self._connect()) as db, db:
-            now = _clock()
-            db.execute(
-                """UPDATE mail_review SET status = 'approved', revision = revision + 1, updated_at = ?, receipt = ?
-                    WHERE account = ? AND status = 'queued' AND updated_at < ?""",
-                (now, _json({"kind": "queue_expired"}), account, now - _ABANDONED_AFTER_MS),
-            )
-            db.execute(
-                """UPDATE mail_review SET status = 'confirming', updated_at = ?
-                    WHERE account = ? AND status = 'sending' AND updated_at < ?""",
-                (now, account, now - _ABANDONED_AFTER_MS),
-            )
-            active = db.execute(
-                """SELECT id, revision FROM mail_review
-                    WHERE account = ? AND status IN ('sending', 'confirming')""",
-                (account,),
-            ).fetchall()
-            for row in active:
-                # A nonblocking probe inside this write transaction cannot
-                # deadlock a worker holding its lock while saving the receipt.
-                with self.delivery_lock(row["id"]) as idle:
-                    if idle:
-                        db.execute(
-                            """UPDATE mail_review SET status = 'uncertain', revision = revision + 1,
-                                    updated_at = ?, receipt = ?
-                                WHERE account = ? AND id = ? AND revision = ?""",
-                            (now, _json({"kind": "worker_stopped"}), account, row["id"], row["revision"]),
-                        )
+            self._recover_deliveries(db, account)
             actions = _action_account(account) if include_actions else account
             rows = db.execute(
                 """SELECT * FROM mail_review WHERE account IN (?, ?) AND receipt IS NOT '{"kind":"legacy_duplicate"}' AND

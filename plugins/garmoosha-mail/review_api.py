@@ -165,6 +165,17 @@ def list_proposals(args: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
     }
 
 
+def pending_summary(_args: dict[str, Any]) -> dict[str, Any]:
+    """How many entries in this profile's bound mailbox need the person's decision."""
+    account = mail.saved_account()
+    if account is None:
+        return {"pending": 0}
+    scope = _scope(account)
+    count = _queue().pending_count(scope)
+    current = mail.saved_account()
+    return {"pending": count if current is not None and _scope(current) == scope else None}
+
+
 def preview_source(args: dict[str, Any]) -> dict[str, Any]:
     """Read the original from this profile's current mailbox on demand."""
     proposal_id = _text(args, "id", 64)

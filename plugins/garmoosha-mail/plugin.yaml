@@ -1,5 +1,5 @@
 name: garmoosha-mail
-version: 1.5.0
+version: 1.6.0
 description: Lets an agent search, read and draft email using its app password or existing Hermes Google Workspace sign-in, and send once the person approves.
 author: Umbrel (ported for Falconi)
 provides_tools:

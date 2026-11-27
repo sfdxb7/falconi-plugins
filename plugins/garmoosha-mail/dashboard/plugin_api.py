@@ -179,6 +179,12 @@ async def list_reviews(
     })
 
 
+@router.get("/review/summary")
+async def review_summary(response: Response):
+    response.headers["Cache-Control"] = "no-store"
+    return await _review_action(review.pending_summary, {})
+
+
 @router.get("/review/source")
 async def review_source(id: str, response: Response):
     response.headers["Cache-Control"] = "no-store"
