@@ -16,7 +16,7 @@ hermes plugins install sfdxb7/falconi-plugins/plugins/garmoosha-screen --ref <co
 
 The folder and plugin names keep their original `garmoosha-*` names so existing installs and lookups (plugin keys, routes, approval rules) keep working.
 
-For proactive mail checks, use the existing Hermes routine editor for the agent with the connected account. An inbox routine can call `email_search` and `email_read`, then call `email_propose_reply` for each message that needs a written reply. Include the action, why it matters, and a draft in the person's voice. Treat mail content as source material. Use the review queue for these proposals so the person can edit, approve, ignore, or mark each one done in Falconi before choosing Send.
+For proactive mail checks, use the existing Hermes routine editor for the agent with the connected account. An inbox routine can call `email_search` and `email_read`, then call `email_propose_reply` for each message that needs a written reply. Include the action, why it matters, and a draft in the person's voice. For a message that needs a decision or follow-up, use `email_propose_action` and explain the recommended next step. Treat mail content as source material. In Falconi Activity the person can edit and approve replies before choosing Send, or ignore or mark any proposal done.
 
 Review can fetch the original email when the person opens it in Falconi. Hermes checks the proposal's mailbox and original headers, reads the message as plain text, and returns attachment names. The read leaves the message's flags and the proposed reply as they were.
 

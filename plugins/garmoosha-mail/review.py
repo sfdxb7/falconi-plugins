@@ -59,6 +59,11 @@ def _clock() -> int:
     return time.time_ns() // 1_000_000
 
 
+def _action_account(account: str) -> str:
+    # Dashboard versions that know only replies query the unprefixed account.
+    return f"action:{account}"
+
+
 class ReviewQueue:
     def __init__(self, home: Path):
         self.path = home / "garmoosha-mail-review.sqlite3"
@@ -107,27 +112,32 @@ class ReviewQueue:
         source_key: str,
         source: dict[str, Any],
         recommendation: str,
-        draft: dict[str, Any],
+        draft: dict[str, Any] | None,
     ) -> tuple[str, bool]:
         """Polling the same source again preserves every existing decision and edit."""
         proposal_id = uuid4().hex
+        stored_account = _action_account(account) if draft is None else account
         with closing(self._connect()) as db, db:
-            inserted = db.execute(
+            # Check both kinds and insert under one write lock.
+            db.execute("BEGIN IMMEDIATE")
+            existing = db.execute(
+                """SELECT id FROM mail_review WHERE account IN (?, ?) AND source_key = ?
+                    ORDER BY rowid LIMIT 1""",
+                (account, _action_account(account), source_key),
+            ).fetchone()
+            if existing is not None:
+                return existing["id"], False
+            db.execute(
                 """INSERT INTO mail_review
                     (id, account, source_key, source, recommendation, draft, status, revision, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, 'proposed', 1, ?)
-                    ON CONFLICT(account, source_key) DO NOTHING""",
-                (proposal_id, account, source_key, _json(source), recommendation, _json(draft), _clock()),
+                    VALUES (?, ?, ?, ?, ?, ?, 'proposed', 1, ?)""",
+                (proposal_id, stored_account, source_key, _json(source), recommendation, _json(draft), _clock()),
             )
-            if inserted.rowcount:
-                return proposal_id, True
-            existing = db.execute(
-                "SELECT id FROM mail_review WHERE account = ? AND source_key = ?",
-                (account, source_key),
-            ).fetchone()
-            return existing["id"], False
+            return proposal_id, True
 
-    def list(self, account: str, limit: int = 50, *, before: str | None = None) -> list[dict[str, Any]]:
+    def list(
+        self, account: str, limit: int = 50, *, before: str | None = None, include_actions: bool = False,
+    ) -> list[dict[str, Any]]:
         with closing(self._connect()) as db, db:
             now = _clock()
             db.execute(
@@ -156,19 +166,21 @@ class ReviewQueue:
                                 WHERE account = ? AND id = ? AND revision = ?""",
                             (now, _json({"kind": "worker_stopped"}), account, row["id"], row["revision"]),
                         )
+            actions = _action_account(account) if include_actions else account
             rows = db.execute(
-                """SELECT * FROM mail_review WHERE account = ? AND
-                    (? IS NULL OR rowid < (SELECT rowid FROM mail_review WHERE account = ? AND id = ?))
+                """SELECT * FROM mail_review WHERE account IN (?, ?) AND
+                    (? IS NULL OR rowid < (SELECT rowid FROM mail_review WHERE account IN (?, ?) AND id = ?))
                     ORDER BY rowid DESC
                     LIMIT ?""",
-                (account, before, account, before, limit),
+                (account, actions, before, account, actions, before, limit),
             )
             return [_row(row) for row in rows]
 
     def get(self, account: str, proposal_id: str) -> dict[str, Any] | None:
         with closing(self._connect()) as db:
             row = db.execute(
-                "SELECT * FROM mail_review WHERE account = ? AND id = ?", (account, proposal_id),
+                "SELECT * FROM mail_review WHERE account IN (?, ?) AND id = ?",
+                (account, _action_account(account), proposal_id),
             ).fetchone()
             return _row(row) if row else None
 
@@ -184,21 +196,26 @@ class ReviewQueue:
         receipt: dict[str, Any] | None = None,
         bump: bool = True,
         min_updated_at: int = 0,
+        include_actions: bool = False,
     ) -> dict[str, Any] | None:
         places = ", ".join("?" for _ in allowed)
         with closing(self._connect()) as db, db:
             row = db.execute(
                 f"""UPDATE mail_review SET status = ?, revision = revision + ?, updated_at = ?,
                         draft = COALESCE(?, draft), receipt = COALESCE(?, receipt)
-                    WHERE account = ? AND id = ? AND revision = ? AND updated_at >= ? AND status IN ({places})
+                    WHERE account IN (?, ?) AND id = ? AND revision = ? AND updated_at >= ? AND status IN ({places})
                     RETURNING *""",
                 (status, int(bump), _clock(), _json(draft) if draft is not None else None,
-                 _json(receipt) if receipt is not None else None, account, proposal_id, revision, min_updated_at, *allowed),
+                 _json(receipt) if receipt is not None else None, account,
+                 _action_account(account) if include_actions else account, proposal_id, revision, min_updated_at, *allowed),
             ).fetchone()
             return _row(row) if row else None
 
     def edit(self, account: str, proposal_id: str, revision: int, draft: dict[str, Any]) -> dict[str, Any] | None:
-        return self._update(account, proposal_id, revision, ("proposed", "approved", "failed"), "proposed", draft=draft, receipt={})
+        return self._update(
+            account, proposal_id, revision, ("proposed", "approved", "failed"), "proposed",
+            draft=draft, receipt={},
+        )
 
     def decide(self, account: str, proposal_id: str, revision: int, choice: str) -> dict[str, Any] | None:
         allowed = {
@@ -206,7 +223,7 @@ class ReviewQueue:
             "ignored": ("proposed", "approved", "failed"),
             "completed": ("proposed", "approved", "failed", "uncertain"),
         }
-        return self._update(account, proposal_id, revision, allowed[choice], choice)
+        return self._update(account, proposal_id, revision, allowed[choice], choice, include_actions=choice != "approved")
 
     def queue_send(self, account: str, proposal_id: str, revision: int) -> dict[str, Any] | None:
         return self._update(account, proposal_id, revision, ("approved",), "queued", receipt={}, bump=False)
