@@ -143,6 +143,8 @@ def _failure(exc: mail.MailError) -> str:
         "app_password": "The email provider wants an app password. The person can make one and update it in Falconi.",
         "unreachable": "Couldn't reach the email server. Try again in a moment.",
         "tls": "Couldn't make a secure connection to the email server.",
+        "google_signin": "Check the Google Workspace connection and Gmail permissions in this Hermes profile.",
+        "account_changed": "The connected Gmail address changed. Reconnect it in Falconi.",
     }
     if exc.kind in ("invalid", "not_found", "refused"):
         return _error(exc.detail or exc.kind, kind=exc.kind)
@@ -166,7 +168,7 @@ def email_search(args: dict[str, Any], **kwargs: Any) -> str:
     if account is None:
         return _error(NOT_CONNECTED)
     try:
-        with mail.Mailbox(account) as box:
+        with mail.open_mailbox(account) as box:
             found = box.search(str(args.get("query") or ""), str(args.get("folder") or ""), args.get("limit") or mail.SEARCH_LIMIT)
     except Exception as exc:
         return _failure(mail.classify(exc, "imap", account))
@@ -178,7 +180,7 @@ def email_read(args: dict[str, Any], **kwargs: Any) -> str:
     if account is None:
         return _error(NOT_CONNECTED)
     try:
-        with mail.Mailbox(account) as box:
+        with mail.open_mailbox(account) as box:
             message = box.read(str(args.get("id") or ""))
     except Exception as exc:
         return _failure(mail.classify(exc, "imap", account))

@@ -54,13 +54,14 @@ from email.utils import format_datetime, formataddr, make_msgid, parseaddr, pars
 from html.parser import HTMLParser
 from typing import Any, Iterable, Optional
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 PREFIX = "GARMOOSHA_MAIL_"
 # Read-only fallback: an Umbrel murmur-mail .env keeps working after a move to this plugin.
 # A GARMOOSHA_MAIL_ key wins; writes only ever use PREFIX.
 LEGACY_PREFIX = "MURMUR_MAIL_"
 REQUIRED = ("ADDRESS", "PASSWORD", "IMAP_HOST", "SMTP_HOST")
 OPTIONAL = ("IMAP_PORT", "IMAP_SECURITY", "SMTP_PORT", "SMTP_SECURITY", "USERNAME", "NAME", "PROVIDER", "SAVE_SENT", "AGENT")
+WORKSPACE_GMAIL = "WORKSPACE_GMAIL"
 SECURITIES = ("ssl", "starttls", "none")
 PROVIDERS = ("gmail", "icloud", "fastmail", "yahoo", "other")
 
@@ -90,6 +91,7 @@ class Account:
     name: str = ""
     provider: str = "other"
     save_sent: bool = True
+    workspace: bool = False
 
     @property
     def login(self) -> str:
@@ -109,6 +111,7 @@ class Account:
             "imap": {"host": self.imap_host, "port": self.imap_port, "security": self.imap_security},
             "smtp": {"host": self.smtp_host, "port": self.smtp_port, "security": self.smtp_security},
             "save_sent": self.save_sent,
+            **({"transport": "workspace"} if self.workspace else {}),
         }
 
 
@@ -138,6 +141,11 @@ def _flag(value: str, default: bool) -> bool:
 
 def account_from(values: dict[str, str]) -> tuple[Optional[Account], list[str]]:
     """The account in ``values`` (keyed by short name: ADDRESS, PASSWORD…), or None and what's missing."""
+    if values.get(WORKSPACE_GMAIL):
+        linked = workspace_binding(values[WORKSPACE_GMAIL])
+        if linked is None:
+            return None, [PREFIX + WORKSPACE_GMAIL]
+        return Account(linked[1], "", "", "", provider="gmail", workspace=True), []
     clean = {k: str(values.get(k) or "").strip() for k in REQUIRED + OPTIONAL}
     # An app password is kept exactly as given, apart from the ends.
     clean["PASSWORD"] = str(values.get("PASSWORD") or "").strip()
@@ -172,6 +180,8 @@ def account_from(values: dict[str, str]) -> tuple[Optional[Account], list[str]]:
 def saved_values(secrets: dict[str, str]) -> dict[str, str]:
     """The agent's saved settings by short name, from its secret mapping."""
     out: dict[str, str] = {}
+    if secrets.get(PREFIX + WORKSPACE_GMAIL):
+        out[WORKSPACE_GMAIL] = str(secrets[PREFIX + WORKSPACE_GMAIL])
     for key in REQUIRED + OPTIONAL:
         for prefix in (PREFIX, LEGACY_PREFIX):
             value = secrets.get(prefix + key)
@@ -204,7 +214,23 @@ def current_agent() -> str:
 
 def is_inherited(values: dict[str, str], agent: str) -> bool:
     """Settings that belong to another agent (a copy Hermes made when this agent was created)."""
+    if values.get(WORKSPACE_GMAIL):
+        binding = workspace_binding(values[WORKSPACE_GMAIL])
+        return binding is None or binding[0] != agent
     return bool(values) and str(values.get("AGENT") or "").strip() != agent
+
+
+def workspace_binding(value: str) -> tuple[str, str] | None:
+    try:
+        pair = json.loads(value)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(pair, list) or len(pair) != 2:
+        return None
+    agent, address = pair
+    if not isinstance(agent, str) or not agent or not isinstance(address, str) or not _looks_like_address(address):
+        return None
+    return agent, address
 
 
 def saved_account() -> Optional[Account]:
@@ -887,7 +913,8 @@ class Draft:
     def digest(self, account: Account) -> str:
         """What a person approves: this exact message from this account."""
         payload = json.dumps(
-            {"from": account.address, "to": self.to, "cc": self.cc, "bcc": self.bcc, "subject": self.subject, "body": self.body, "reply": self.reply_to_id},
+            {"from": account.address, "to": self.to, "cc": self.cc, "bcc": self.bcc, "subject": self.subject, "body": self.body, "reply": self.reply_to_id,
+             **({"transport": "workspace"} if account.workspace else {})},
             sort_keys=True,
             ensure_ascii=False,
         )
@@ -911,7 +938,10 @@ def draft_from_args(args: dict[str, Any]) -> Draft:
 def reply_source_digest(original: dict[str, Any]) -> str:
     """Bind a proposed reply to the original headers even if its mailbox UID is reused."""
     fields = ("message_id", "references", "from", "reply_address", "subject", "date")
-    wire = json.dumps([original.get(field) for field in fields], ensure_ascii=False)
+    values = [original.get(field) for field in fields]
+    if "thread_id" in original:
+        values.append(original["thread_id"])
+    wire = json.dumps(values, ensure_ascii=False)
     return hashlib.sha256(wire.encode("utf-8")).hexdigest()
 
 
@@ -1418,8 +1448,19 @@ def smtp_session(account: Account):
 # ── What the tools and Falconi ask for ──────────────────────────────────────
 
 
+def open_mailbox(account: Account):
+    if account.workspace:
+        from .gmail import GmailMailbox
+
+        return GmailMailbox(account)
+    return Mailbox(account)
+
+
 def check(account: Account) -> dict[str, Any]:
     """Sign in to both servers, and bring back the three newest messages as proof."""
+    if account.workspace:
+        with open_mailbox(account):
+            return {"ok": True, "account": account.public(), "newest": []}
     with Mailbox(account) as box:
         count = box.select("INBOX")
         newest: list[dict[str, Any]] = []
@@ -1443,6 +1484,9 @@ def check(account: Account) -> dict[str, Any]:
 
 
 def draft(account: Account, d: Draft) -> dict[str, Any]:
+    if account.workspace:
+        with open_mailbox(account) as box:
+            return box.write(d, send=False)
     with Mailbox(account) as box:
         original = box.headers_of(d.reply_to_id) if d.reply_to_id else None
         message = build_message(account, d, original, reply_defaults=True)
@@ -1470,6 +1514,9 @@ def _addressed(message: EmailMessage, header: str) -> list[str]:
 
 
 def send(account: Account, d: Draft, *, expected_source: str = "") -> dict[str, Any]:
+    if account.workspace:
+        with open_mailbox(account) as box:
+            return box.write(d, send=True, expected_source=expected_source)
     original = None
     if d.reply_to_id:
         with Mailbox(account) as box:

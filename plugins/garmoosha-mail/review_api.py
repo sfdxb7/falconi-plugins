@@ -42,6 +42,8 @@ def _queue() -> ReviewQueue:
 def _scope(account: mail.Account) -> str:
     identifying = [account.address, account.imap_host, account.imap_port, account.login,
                    account.smtp_host, account.smtp_port]
+    if account.workspace:
+        identifying.append("workspace")
     return sha256(json.dumps(identifying).encode("utf-8")).hexdigest()
 
 
@@ -56,7 +58,7 @@ def propose_reply(account: mail.Account, args: dict[str, Any]) -> dict[str, Any]
     source_id = _text(args, "reply_to_id", 1024).strip()
     body = _text(args, "body", mail.SEND_BODY_CHARS)
     recommendation = _text(args, "recommendation", 1000).strip()
-    with mail.Mailbox(account) as box:
+    with mail.open_mailbox(account) as box:
         original = box.headers_of(source_id)
     subject = args["subject"] if "subject" in args else mail._reply_subject(original["subject"])
     if not isinstance(subject, str) or len(subject) > 512:
@@ -123,11 +125,11 @@ def preview_source(args: dict[str, Any]) -> dict[str, Any]:
         return {"ok": False, "reason": "unavailable"}
     source = item["source"]
     try:
-        with mail.Mailbox(account) as box:
+        with mail.open_mailbox(account) as box:
             original = box.read(source["id"], expected_source=source["digest"])
     except Exception as exc:
         failure = mail.classify(exc, "imap", account)
-        reason = "unavailable" if failure.kind in ("not_found", "source_changed") else "read_failed"
+        reason = "unavailable" if failure.kind in ("account_changed", "not_found", "source_changed") else "read_failed"
         return {"ok": False, "reason": reason}
     current = mail.saved_account()
     if current is None or _scope(current) != scope:
@@ -176,7 +178,7 @@ def _deliver(queue: ReviewQueue, scope: str, proposal_id: str, revision: int) ->
 
 
 def _deliver_with_lock(queue: ReviewQueue, scope: str, proposal_id: str, revision: int) -> None:
-    # Do not start SMTP from a snapshot that merely waited in the executor.
+    # Recheck the claim and account when the delivery worker starts.
     item = queue.claim(scope, proposal_id, revision)
     if item is None:
         return
@@ -192,10 +194,10 @@ def _deliver_with_lock(queue: ReviewQueue, scope: str, proposal_id: str, revisio
             account, mail.draft_from_args(item["draft"]), expected_source=item["source"]["digest"],
         )
     except Exception as exc:
-        # SMTP may have accepted the message before the connection broke. Do
+        # The provider may have accepted the message before the connection broke. Do
         # not reopen its approval or infer that a second attempt is safe.
         kind = exc.kind if isinstance(exc, mail.MailError) else ""
-        definitely_unsent = kind in ("source_changed", "not_found", "refused", "wrong_password", "app_password")
+        definitely_unsent = kind in ("account_changed", "source_changed", "not_found", "refused", "wrong_password", "app_password", "google_signin")
         receipt = {"kind": kind} if definitely_unsent else {}
         queue.settle(scope, proposal_id, revision, receipt, outcome="failed" if definitely_unsent else "uncertain")
         return

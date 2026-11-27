@@ -202,7 +202,7 @@ class ReviewQueue:
 
     def decide(self, account: str, proposal_id: str, revision: int, choice: str) -> dict[str, Any] | None:
         allowed = {
-            "approved": ("proposed",),
+            "approved": ("proposed", "failed"),
             "ignored": ("proposed", "approved", "failed"),
             "completed": ("proposed", "approved", "failed", "uncertain"),
         }
