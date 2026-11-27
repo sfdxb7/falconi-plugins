@@ -8,12 +8,15 @@ from dataclasses import asdict
 from hashlib import sha256
 import json
 from pathlib import Path
+import re
 from typing import Any
 
 from . import mail
 from .review import ReviewQueue
 
 _delivery = ThreadPoolExecutor(max_workers=2, thread_name_prefix="falconi-mail-review")
+_SEND_BATCH = 20
+_PROPOSAL_ID = re.compile(r"[a-f0-9]{32}")
 
 _ROUTINE_STARTER = {
     "template": "mail-review",
@@ -131,18 +134,34 @@ def _revision(args: dict[str, Any]) -> tuple[str, int]:
 
 
 def list_proposals(args: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+    empty = {"account": None, "items": [], "next": None}
     account = mail.saved_account()
     if account is None:
-        return {"account": None, "items": [], "next": None}
+        return empty
     before = _text(args, "before", 64) if args.get("before") is not None else None
     include_actions = args.get("include_actions") is True
-    rows = _queue().list(_scope(account), limit=51, before=before, include_actions=include_actions)
+    active_only = args.get("active_only") is True
+    tracked = ()
+    if before is None and args.get("tracked") is not None:
+        tracked = tuple(_text(args, "tracked", _SEND_BATCH * 33 - 1).split(","))
+        if len(tracked) > _SEND_BATCH or any(not _PROPOSAL_ID.fullmatch(value) for value in tracked):
+            raise ValueError("A list of up to 20 proposal IDs is required")
+    scope = _scope(account)
+    rows, deliveries = _queue().page(
+        scope, limit=51, before=before, include_actions=include_actions, active_only=active_only, tracked=tracked,
+    )
+    if active_only or tracked:
+        current = mail.saved_account()
+        if current is None or _scope(current) != scope:
+            return empty
     starter = _ACTION_STARTER if include_actions else _ROUTINE_STARTER
     return {
         "account": account.address, "items": rows[:50],
         "next": rows[49]["id"] if len(rows) == 51 else None,
         "starter": starter if before is None else None,
         "source_preview": True,
+        **({"active_only": True} if active_only else {}),
+        **({"tracked": deliveries} if tracked else {}),
     }
 
 
@@ -241,7 +260,7 @@ def _deliver_with_lock(queue: ReviewQueue, scope: str, proposal_id: str, revisio
 def send_proposals(args: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
     """An authenticated client's final Send action. No agent tool calls this."""
     selections = args.get("items")
-    if not isinstance(selections, list) or not 1 <= len(selections) <= 20:
+    if not isinstance(selections, list) or not 1 <= len(selections) <= _SEND_BATCH:
         raise ValueError("Select between 1 and 20 approved replies")
     if any(not isinstance(selection, dict) for selection in selections):
         raise ValueError("Select an exact revision for each reply")
