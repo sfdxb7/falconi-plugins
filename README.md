@@ -20,4 +20,6 @@ For proactive mail checks, use the existing Hermes routine editor for the agent 
 
 Review can fetch the original email when the person opens it in Falconi. Hermes checks the proposal's mailbox and original headers, reads the message as plain text, and returns attachment names. The read leaves the message's flags and the proposed reply as they were.
 
+If a Hermes profile already uses the Google Workspace skill, Falconi can link that Gmail account through the same review queue. Hermes verifies the address and the credential's Gmail read and send permissions. The user confirms the address in Falconi. The binding belongs to that Hermes profile, and the OAuth credential stays in the Google Workspace skill's storage. Removing the email connection removes the binding. Reply delivery uses Gmail's thread and message headers while each approved revision goes through the existing Send action.
+
 MIT licensed. The mail and screen folders also carry Umbrel's MIT notice for the code they started from.

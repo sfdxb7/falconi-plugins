@@ -43,6 +43,7 @@ def _package() -> str:
 _name = _package()
 mail = import_module(f"{_name}.mail")
 review = import_module(f"{_name}.review_api")
+gmail = import_module(f"{_name}.gmail")
 
 # One check at a time per agent: each is a real sign-in, and providers lock out bursts of them.
 _locks: dict[str, asyncio.Lock] = {}
@@ -73,12 +74,8 @@ def _enabled() -> bool:
     return on and not off
 
 
-def _saved() -> tuple[dict[str, str], bool]:
-    """This agent's saved settings, and whether they're a copy of another agent's."""
-    values = mail.saved_values(mail.profile_secrets())
-    if mail.is_inherited(values, mail.current_agent()):
-        return {}, True
-    return values, False
+def _saved() -> tuple[dict[str, Any], bool]:
+    return mail.active_account_settings()
 
 
 @router.get("/status")
@@ -96,7 +93,21 @@ async def status():
         # Another agent's account, copied into this agent's .env when Hermes made it: unused, and
         # Falconi clears it away (its keys are the same GARMOOSHA_MAIL_ ones).
         "inherited": inherited,
+        "workspace_gmail": gmail.available(),
     }
+
+
+@router.post("/workspace/check")
+async def check_workspace_gmail():
+    lock = _locks.setdefault(_home(), asyncio.Lock())
+    async with lock:
+        try:
+            address = await asyncio.wait_for(asyncio.to_thread(gmail.connected_address), timeout=30)
+        except mail.MailError as exc:
+            return {"ok": False, "error": exc.public()}
+        except asyncio.TimeoutError:
+            return _failed("unreachable", "gmail", "Gmail took too long to answer.")
+    return {"ok": True, "address": address}
 
 
 class CheckRequest(BaseModel):
