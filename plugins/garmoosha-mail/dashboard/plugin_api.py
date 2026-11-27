@@ -169,8 +169,14 @@ async def _review_action(handler, body: dict[str, Any]):
 
 
 @router.get("/review")
-async def list_reviews(before: Optional[str] = None, include_actions: bool = False):
-    return await _review_action(review.list_proposals, {"before": before, "include_actions": include_actions})
+async def list_reviews(
+    response: Response, before: Optional[str] = None, include_actions: bool = False,
+    active_only: bool = False, tracked: Optional[str] = None,
+):
+    response.headers["Cache-Control"] = "no-store"
+    return await _review_action(review.list_proposals, {
+        "before": before, "include_actions": include_actions, "active_only": active_only, "tracked": tracked,
+    })
 
 
 @router.get("/review/source")

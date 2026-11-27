@@ -202,6 +202,55 @@ with queue.delivery_lock(sys.argv[3]) as acquired:
         })
         ctx.register_rpc.assert_not_called()
 
+    def test_finished_reviews_do_not_displace_pending_decisions(self):
+        account = mail.Account("me@example.test", "fixture", "imap.example.test", "smtp.example.test")
+        scope = review_api._scope(account)
+        old, _ = self.queue.propose(scope, "old", self.source, "Make a decision", None)
+        for i in range(52):
+            finished, _ = self.queue.propose(scope, f"closed-{i}", self.source, "Reply", self.draft)
+            self.queue.decide(scope, finished, 1, "completed")
+        with patch.object(review_api, "_queue", return_value=self.queue), patch.object(mail, "saved_account", return_value=account):
+            active = review_api.list_proposals({"include_actions": True, "active_only": True})
+            self.assertEqual([item["id"] for item in active["items"]], [old])
+            self.assertIsNone(active["next"])
+            self.assertTrue(active["active_only"])
+            self.assertEqual(len(review_api.list_proposals({})["items"]), 50)
+
+    def test_active_cursor_can_reference_a_closed_row_and_deliveries_have_their_own_space(self):
+        account = mail.Account("me@example.test", "fixture", "imap.example.test", "smtp.example.test")
+        scope = review_api._scope(account)
+        ids = [
+            self.queue.propose(scope, f"active-{i}", self.source, "Reply", self.draft)[0]
+            for i in range(52)
+        ]
+        sent = ids[-1]
+        foreign, _ = self.queue.propose("other-account", "source", self.source, "Reply", self.draft)
+        with patch.object(review_api, "_queue", return_value=self.queue), patch.object(mail, "saved_account", return_value=account):
+            first = review_api.list_proposals({"active_only": True})
+            cursor = first["next"]
+            self.queue.decide(scope, cursor, 1, "ignored")
+            second = review_api.list_proposals({"active_only": True, "before": cursor})
+            self.assertEqual([item["id"] for item in second["items"]], ids[1::-1])
+            revision = self.queue.decide(scope, sent, 1, "approved")["revision"]
+            self.queue.queue_send(scope, sent, revision)
+            self.queue.claim(scope, sent, revision)
+            self.queue.settle(scope, sent, revision, {"message_id": "fixture"}, outcome="sent")
+            page = review_api.list_proposals({"active_only": True, "tracked": f"{sent},{foreign}"})
+            self.assertEqual(len(page["items"]), 50)
+            self.assertNotIn(sent, [item["id"] for item in page["items"]])
+            self.assertEqual([(item["id"], item["status"]) for item in page["tracked"]], [(sent, "sent")])
+
+    def test_active_list_discards_items_when_the_same_address_changes_provider(self):
+        first = mail.Account("same@example.test", "fixture", "old.example.test", "old.example.test")
+        second = mail.Account("same@example.test", "fixture", "new.example.test", "new.example.test")
+        item, _ = self.queue.propose(review_api._scope(first), "source", self.source, "Private", self.draft)
+        with patch.object(review_api, "_queue", return_value=self.queue), \
+                patch.object(mail, "saved_account", side_effect=[first, second]):
+            page = review_api.list_proposals({"active_only": True, "tracked": item})
+        self.assertIsNone(page["account"])
+        self.assertEqual(page["items"], [])
+        self.assertFalse(page.get("tracked"))
+
     def test_action_items_require_opt_in_before_paging(self):
         older, _ = self.propose()
         action, _ = self.queue.propose("mailbox", "action", self.source, "Choose a new date", None)

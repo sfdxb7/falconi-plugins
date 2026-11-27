@@ -154,6 +154,13 @@ class ReviewQueue:
     def list(
         self, account: str, limit: int = 50, *, before: str | None = None, include_actions: bool = False,
     ) -> list[dict[str, Any]]:
+        rows, _ = self.page(account, limit, before=before, include_actions=include_actions)
+        return rows
+
+    def page(
+        self, account: str, limit: int, *, before: str | None = None, include_actions: bool = False,
+        active_only: bool = False, tracked: tuple[str, ...] = (),
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         with closing(self._connect()) as db, db:
             now = _clock()
             db.execute(
@@ -185,12 +192,22 @@ class ReviewQueue:
             actions = _action_account(account) if include_actions else account
             rows = db.execute(
                 """SELECT * FROM mail_review WHERE account IN (?, ?) AND receipt IS NOT '{"kind":"legacy_duplicate"}' AND
+                    (NOT ? OR status NOT IN ('sent', 'ignored', 'completed')) AND
                     (? IS NULL OR rowid < (SELECT rowid FROM mail_review WHERE account IN (?, ?) AND id = ?))
                     ORDER BY rowid DESC
                     LIMIT ?""",
-                (account, actions, before, account, actions, before, limit),
+                (account, actions, active_only, before, account, actions, before, limit),
             )
-            return [_row(row) for row in rows]
+            page = [_row(row) for row in rows]
+            if not tracked:
+                return page, []
+            places = ", ".join("?" for _ in tracked)
+            deliveries = db.execute(
+                f"""SELECT * FROM mail_review WHERE account = ? AND id IN ({places})
+                    AND receipt IS NOT '{{"kind":"legacy_duplicate"}}' ORDER BY rowid DESC""",
+                (account, *tracked),
+            )
+            return page, [_row(row) for row in deliveries]
 
     def get(self, account: str, proposal_id: str) -> dict[str, Any] | None:
         with closing(self._connect()) as db:
