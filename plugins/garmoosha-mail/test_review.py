@@ -21,6 +21,30 @@ class ReviewTests(unittest.TestCase):
     def propose(self):
         return self.queue.propose("mailbox", "source", self.source, "Reply today", self.draft)
 
+    def test_original_read_rejects_a_reused_uid_before_fetching_the_body(self):
+        account = mail.Account("me@example.test", "fixture", "imap.example.test", "smtp.example.test")
+        box = mail.Mailbox(account)
+        headers = {"BODY[HEADER]": b"From: Actual <elsewhere@example.test>\r\nSubject: Other topic\r\n"}
+        with patch.object(box, "locate", return_value=("INBOX", 31)), patch.object(box, "select"), \
+                patch.object(box, "fetch", return_value=[headers]), patch.object(box, "_body_by_structure") as read:
+            with self.assertRaises(mail.MailError) as caught:
+                box.read("INBOX:31", expected_source="the-original-digest")
+            self.assertEqual(caught.exception.kind, "source_changed")
+            read.assert_not_called()
+
+    def test_mailbox_switch_during_a_read_discards_the_old_body(self):
+        first = mail.Account("me@example.test", "fixture", "imap.example.test", "smtp.example.test")
+        second = mail.Account("other@example.test", "fixture", "imap.example.test", "smtp.example.test")
+        source = {**self.source, "digest": "original"}
+        proposal, _ = self.queue.propose(review_api._scope(first), "source", source, "Reply today", self.draft)
+        with patch.object(review_api, "_queue", return_value=self.queue), \
+                patch.object(mail, "saved_account", side_effect=[first, second]), \
+                patch.object(mail, "Mailbox") as mailbox:
+            box = mailbox.return_value.__enter__.return_value
+            box.read.return_value = {"body": "Private original"}
+            self.assertEqual(review_api.preview_source({"id": proposal}), {"ok": False, "reason": "unavailable"})
+            box.read.assert_called_once_with("INBOX:31", expected_source="original")
+
     def test_polling_preserves_the_persons_edit_and_decision(self):
         proposal_id, created = self.propose()
         self.assertTrue(created)

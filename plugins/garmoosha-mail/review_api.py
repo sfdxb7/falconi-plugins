@@ -107,6 +107,36 @@ def list_proposals(args: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
         "account": account.address, "items": rows[:50],
         "next": rows[49]["id"] if len(rows) == 51 else None,
         "starter": _ROUTINE_STARTER if before is None else None,
+        "source_preview": True,
+    }
+
+
+def preview_source(args: dict[str, Any]) -> dict[str, Any]:
+    """Read the original from this profile's current mailbox on demand."""
+    proposal_id = _text(args, "id", 64)
+    account = mail.saved_account()
+    if account is None:
+        return {"ok": False, "reason": "unavailable"}
+    scope = _scope(account)
+    item = _queue().get(scope, proposal_id)
+    if item is None or not item["source"].get("digest"):
+        return {"ok": False, "reason": "unavailable"}
+    source = item["source"]
+    try:
+        with mail.Mailbox(account) as box:
+            original = box.read(source["id"], expected_source=source["digest"])
+    except Exception as exc:
+        failure = mail.classify(exc, "imap", account)
+        reason = "unavailable" if failure.kind in ("not_found", "source_changed") else "read_failed"
+        return {"ok": False, "reason": reason}
+    current = mail.saved_account()
+    if current is None or _scope(current) != scope:
+        return {"ok": False, "reason": "unavailable"}
+    return {
+        "ok": True,
+        "body": original["body"],
+        "truncated": original["body_truncated"],
+        "attachments": [attachment["filename"] for attachment in original["attachments"]],
     }
 
 

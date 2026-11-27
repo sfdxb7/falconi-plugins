@@ -54,7 +54,7 @@ from email.utils import format_datetime, formataddr, make_msgid, parseaddr, pars
 from html.parser import HTMLParser
 from typing import Any, Iterable, Optional
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 PREFIX = "GARMOOSHA_MAIL_"
 # Read-only fallback: an Umbrel murmur-mail .env keeps working after a move to this plugin.
 # A GARMOOSHA_MAIL_ key wins; writes only ever use PREFIX.
@@ -915,6 +915,21 @@ def reply_source_digest(original: dict[str, Any]) -> str:
     return hashlib.sha256(wire.encode("utf-8")).hexdigest()
 
 
+def _reply_headers(headers: EmailMessage) -> dict[str, Any]:
+    sender = people(headers.get("From", ""))
+    reply = people(headers.get("Reply-To", "")) or sender
+    address = reply[0]["address"] if reply else ""
+    name = reply[0]["name"] if reply else ""
+    return {
+        "subject": decode_words(headers.get("Subject", "")),
+        "message_id": _one_line(headers.get("Message-ID", "")),
+        "references": _one_line(headers.get("References", "")),
+        "reply_address": formataddr((name, address)) if name and address else address,
+        "from": sender,
+        "date": iso_date(headers.get("Date", "")),
+    }
+
+
 def approval_text(account: Account, draft: Draft) -> str:
     """What the person is asked to approve, line by line (Falconi reads it back the same way)."""
     lines = [f"Send an email from {account.address}"]
@@ -1214,21 +1229,9 @@ class Mailbox:
         if not rows:
             raise MailError("not_found", "imap", "That message isn't there any more.")
         h = BytesHeaderParser(policy=DEFAULT_POLICY).parsebytes(_header_bytes(rows[0]))
-        reply = people(h.get("Reply-To", "")) or people(h.get("From", ""))
-        address = reply[0]["address"] if reply else ""
-        name = reply[0]["name"] if reply else ""
-        return {
-            "folder": raw,
-            "uid": uid,
-            "subject": decode_words(h.get("Subject", "")),
-            "message_id": _one_line(h.get("Message-ID", "")),
-            "references": _one_line(h.get("References", "")),
-            "reply_address": formataddr((name, address)) if name and address else address,
-            "from": people(h.get("From", "")),
-            "date": iso_date(h.get("Date")),
-        }
+        return {"folder": raw, "uid": uid, **_reply_headers(h)}
 
-    def read(self, message_id: str) -> dict[str, Any]:
+    def read(self, message_id: str, *, expected_source: str = "") -> dict[str, Any]:
         raw, uid = self.locate(message_id)
         self.select(raw)
         rows = self.fetch([uid], "(UID FLAGS INTERNALDATE RFC822.SIZE BODYSTRUCTURE BODY.PEEK[HEADER])")
@@ -1236,15 +1239,18 @@ class Mailbox:
             raise MailError("not_found", "imap", "That message isn't there any more.")
         row = rows[0]
         headers = BytesHeaderParser(policy=DEFAULT_POLICY).parsebytes(_header_bytes(row, "BODY[HEADER]"))
+        reply = _reply_headers(headers)
+        if expected_source and reply_source_digest(reply) != expected_source:
+            raise MailError("source_changed", "imap", "The original email changed.")
         flags = {_str(f).lower() for f in (row.get("FLAGS") or [])}
         out: dict[str, Any] = {
             "id": f"{mutf7_decode(raw)}:{uid}",
-            "from": people(headers.get("From", "")),
+            "from": reply["from"],
             "to": people(headers.get("To", "")),
             "cc": people(headers.get("Cc", "")),
             "reply_to": people(headers.get("Reply-To", "")),
-            "subject": decode_words(headers.get("Subject", "")),
-            "date": iso_date(headers.get("Date")) or iso_date(row.get("INTERNALDATE")),
+            "subject": reply["subject"],
+            "date": reply["date"] or iso_date(row.get("INTERNALDATE")),
             "unread": "\\seen" not in flags,
         }
         try:
