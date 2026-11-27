@@ -22,6 +22,8 @@ Review can fetch the original email when the person opens it in Falconi. Hermes 
 
 The Activity queue can request only email that still needs review or has a delivery in progress. Hermes filters before paginating and returns the latest Send batch's outcomes separately. Both reads stay within the selected profile's connected mailbox.
 
+`GET /api/plugins/garmoosha-mail/review/summary?profile=…` gives Falconi the number of entries awaiting a decision in that profile’s currently bound mailbox. It counts recommendations, replies to approve or submit, failed deliveries, and deliveries that need confirmation. The route reads the local queue and returns only `pending`. A mailbox binding that changes during the read returns `null` so Falconi can retry before showing a count.
+
 If a Hermes profile already uses the Google Workspace skill, Falconi can link that Gmail account through the same review queue. Hermes verifies the address and the credential's Gmail read and send permissions. The user confirms the address in Falconi. The binding belongs to that Hermes profile, and the OAuth credential stays in the Google Workspace skill's storage. Removing the email connection removes the binding. Reply delivery uses Gmail's thread and message headers while each approved revision goes through the existing Send action.
 
 MIT licensed. The mail and screen folders also carry Umbrel's MIT notice for the code they started from.

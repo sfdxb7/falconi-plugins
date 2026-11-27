@@ -54,7 +54,7 @@ from email.utils import format_datetime, formataddr, make_msgid, parseaddr, pars
 from html.parser import HTMLParser
 from typing import Any, Iterable, Optional
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 PREFIX = "GARMOOSHA_MAIL_"
 # Read-only fallback: an Umbrel murmur-mail .env keeps working after a move to this plugin.
 # A GARMOOSHA_MAIL_ key wins; writes only ever use PREFIX.
