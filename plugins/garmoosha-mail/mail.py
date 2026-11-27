@@ -41,6 +41,7 @@ import socket
 import ssl
 import threading
 import time
+from uuid import uuid4
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -53,7 +54,7 @@ from email.utils import format_datetime, formataddr, make_msgid, parseaddr, pars
 from html.parser import HTMLParser
 from typing import Any, Iterable, Optional
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 PREFIX = "GARMOOSHA_MAIL_"
 # Read-only fallback: an Umbrel murmur-mail .env keeps working after a move to this plugin.
 # A GARMOOSHA_MAIL_ key wins; writes only ever use PREFIX.
@@ -907,6 +908,13 @@ def draft_from_args(args: dict[str, Any]) -> Draft:
     return Draft(tuple(to), tuple(cc), tuple(bcc), subject, body, reply_to_id)
 
 
+def reply_source_digest(original: dict[str, Any]) -> str:
+    """Bind a proposed reply to the original headers even if its mailbox UID is reused."""
+    fields = ("message_id", "references", "from", "reply_address", "subject", "date")
+    wire = json.dumps([original.get(field) for field in fields], ensure_ascii=False)
+    return hashlib.sha256(wire.encode("utf-8")).hexdigest()
+
+
 def approval_text(account: Account, draft: Draft) -> str:
     """What the person is asked to approve, line by line (Falconi reads it back the same way)."""
     lines = [f"Send an email from {account.address}"]
@@ -1202,7 +1210,7 @@ class Mailbox:
         """What a reply needs from the message it answers."""
         raw, uid = self.locate(message_id)
         self.select(raw)
-        rows = self.fetch([uid], "(UID BODY.PEEK[HEADER.FIELDS (FROM REPLY-TO SUBJECT MESSAGE-ID REFERENCES)])")
+        rows = self.fetch([uid], "(UID BODY.PEEK[HEADER.FIELDS (FROM REPLY-TO SUBJECT MESSAGE-ID REFERENCES DATE)])")
         if not rows:
             raise MailError("not_found", "imap", "That message isn't there any more.")
         h = BytesHeaderParser(policy=DEFAULT_POLICY).parsebytes(_header_bytes(rows[0]))
@@ -1216,6 +1224,8 @@ class Mailbox:
             "message_id": _one_line(h.get("Message-ID", "")),
             "references": _one_line(h.get("References", "")),
             "reply_address": formataddr((name, address)) if name and address else address,
+            "from": people(h.get("From", "")),
+            "date": iso_date(h.get("Date")),
         }
 
     def read(self, message_id: str) -> dict[str, Any]:
@@ -1454,11 +1464,13 @@ def _addressed(message: EmailMessage, header: str) -> list[str]:
     return out
 
 
-def send(account: Account, d: Draft) -> dict[str, Any]:
+def send(account: Account, d: Draft, *, expected_source: str = "") -> dict[str, Any]:
     original = None
     if d.reply_to_id:
         with Mailbox(account) as box:
             original = box.headers_of(d.reply_to_id)
+    if expected_source and (original is None or reply_source_digest(original) != expected_source):
+        raise MailError("source_changed", "imap", "The original email changed before sending.")
     if not d.to:
         raise MailError("invalid", "smtp", "Say who the email is to.")
     message = build_message(account, d, original, reply_defaults=False)
@@ -1532,24 +1544,25 @@ class Approvals:
 
     def ask(self, session: str, digest: str) -> str:
         """The rule key for this message in this chat."""
-        key = self.key(session, digest)
+        ask_id = uuid4().hex
         with self._lock:
             now = time.monotonic()
             self._prune(now)
-            self._asked[key] = (digest, now)
-        return self.RULE + key
+            self._asked[ask_id] = (self.key(session, digest), now)
+        return self.RULE + ask_id
 
     def answered(self, pattern_key: str, choice: str, decided_by: Any = None) -> bool:
         prefix = "plugin_rule:" + self.RULE
-        if not str(pattern_key or "").startswith(prefix) or decided_by:
+        if not str(pattern_key or "").startswith(prefix):
             return False
-        if choice not in ("once", "session", "always"):
-            return False
-        key = str(pattern_key)[len(prefix) :]
+        ask_id = str(pattern_key)[len(prefix) :]
         with self._lock:
-            if key not in self._asked:
+            now = time.monotonic()
+            self._prune(now)
+            asked = self._asked.pop(ask_id, None)
+            if asked is None or decided_by or choice not in ("once", "session", "always"):
                 return False
-            self._granted.setdefault(key, []).append(time.monotonic())
+            self._granted.setdefault(asked[0], []).append(now)
         return True
 
     def spend(self, session: str, digest: str) -> bool:
@@ -1563,5 +1576,4 @@ class Approvals:
             grants.pop(0)
             if not grants:
                 del self._granted[key]
-            self._asked.pop(key, None)
             return True
