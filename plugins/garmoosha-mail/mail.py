@@ -1239,18 +1239,17 @@ class Mailbox:
             raise MailError("not_found", "imap", "That message isn't there any more.")
         row = rows[0]
         headers = BytesHeaderParser(policy=DEFAULT_POLICY).parsebytes(_header_bytes(row, "BODY[HEADER]"))
-        reply = _reply_headers(headers)
-        if expected_source and reply_source_digest(reply) != expected_source:
+        if expected_source and reply_source_digest(_reply_headers(headers)) != expected_source:
             raise MailError("source_changed", "imap", "The original email changed.")
         flags = {_str(f).lower() for f in (row.get("FLAGS") or [])}
         out: dict[str, Any] = {
             "id": f"{mutf7_decode(raw)}:{uid}",
-            "from": reply["from"],
+            "from": people(headers.get("From", "")),
             "to": people(headers.get("To", "")),
             "cc": people(headers.get("Cc", "")),
             "reply_to": people(headers.get("Reply-To", "")),
-            "subject": reply["subject"],
-            "date": reply["date"] or iso_date(row.get("INTERNALDATE")),
+            "subject": decode_words(headers.get("Subject", "")),
+            "date": iso_date(headers.get("Date")) or iso_date(row.get("INTERNALDATE")),
             "unread": "\\seen" not in flags,
         }
         try:

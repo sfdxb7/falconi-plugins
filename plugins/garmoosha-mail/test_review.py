@@ -32,6 +32,17 @@ class ReviewTests(unittest.TestCase):
             self.assertEqual(caught.exception.kind, "source_changed")
             read.assert_not_called()
 
+    def test_ordinary_read_preserves_internationalized_sender_addresses(self):
+        account = mail.Account("me@example.test", "fixture", "imap.example.test", "smtp.example.test")
+        box = mail.Mailbox(account)
+        headers = {"BODY[HEADER]": "From: Sender <josé@example.test>\r\nSubject: Handoff\r\n".encode()}
+        with patch.object(box, "locate", return_value=("INBOX", 31)), patch.object(box, "select"), \
+                patch.object(box, "fetch", return_value=[headers]), \
+                patch.object(box, "_body_by_structure", return_value=("Original message", False, [])):
+            message = box.read("INBOX:31")
+        self.assertEqual(message["from"], [{"name": "Sender", "address": "josé@example.test"}])
+        self.assertEqual(message["body"], "Original message")
+
     def test_mailbox_switch_during_a_read_discards_the_old_body(self):
         first = mail.Account("me@example.test", "fixture", "imap.example.test", "smtp.example.test")
         second = mail.Account("other@example.test", "fixture", "imap.example.test", "smtp.example.test")
