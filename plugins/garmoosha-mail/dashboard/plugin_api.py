@@ -22,7 +22,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Optional, Union
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Response
 from pydantic import BaseModel
 
 log = logging.getLogger(__name__)
@@ -159,6 +159,15 @@ async def _review_action(handler, body: dict[str, Any]):
 @router.get("/review")
 async def list_reviews(before: Optional[str] = None):
     return await _review_action(review.list_proposals, {"before": before})
+
+
+@router.get("/review/source")
+async def review_source(id: str, response: Response):
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return await asyncio.wait_for(_review_action(review.preview_source, {"id": id}), timeout=30)
+    except asyncio.TimeoutError:
+        return {"ok": False, "reason": "read_failed"}
 
 
 @router.post("/review/edit")
