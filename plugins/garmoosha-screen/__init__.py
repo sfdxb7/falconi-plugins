@@ -79,9 +79,12 @@ NOT_HERE = "The person can't take over your browser from this chat. Tell them in
 # The few lines a chat that can show the screen starts with (Hermes adds its own heading). Asking is
 # the last resort: the agent works for the person, and uses what it has first.
 WHEN_TO_ASK = (
-    "You work for the person: a blocked page isn't a blocked task. Find another way, and use what you "
-    "have, like a saved login in `browser_vault`. Only if the task truly depends on this page and needs "
-    f"them personally, like proving they're human, call `{TOOL}` (through `tool_call` if needed)."
+    "You work for the person: a blocked page isn't a blocked task. Find another way first. If the "
+    "task needs an account, use a saved login for the current site through `browser_vault`. If "
+    "there is none and the person needs you to sign in to that site, use `browser_vault` with "
+    "action `save_login` to open the masked prompt for the current page. Never ask for passwords, "
+    "codes or keys in chat. If they decline, respect that choice. For a step they need to do themselves, "
+    f"like proving they're human, call `{TOOL}` (through `tool_call` if needed)."
 )
 
 def _result(data: dict[str, Any]) -> str:

@@ -1,6 +1,6 @@
 name: garmoosha-screen
-version: 1.0.1
-description: Lets an agent, as a last resort, ask the person to take over its browser for a step only they can do, and wait until they hand it back.
+version: 1.0.2
+description: Guides website sign-in through Hermes's secure vault prompts and asks the person to take over for steps only they can do.
 author: Umbrel (ported for Garmoosha)
 provides_tools:
   - ask_for_a_hand
