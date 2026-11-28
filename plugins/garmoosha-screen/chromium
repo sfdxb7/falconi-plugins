@@ -22,9 +22,31 @@
 #
 # --test-type and --disable-infobars hide Chrome for Testing's "only for
 # automated testing" bar.
+# Both screen plugins may wrap one launch. If Murmur ran first, it has already
+# added the screen flags: pass them through without applying the setup twice.
+if [ "${1:-}" = --test-type ] && [ "${2:-}" = --disable-infobars ]; then
+  if [ "${3:-}" = --start-maximized ] && [ "${4:-}" = --hide-crash-restore-bubble ] &&
+     [ "${5:-}" = --garmoosha-browser ] && [ -n "${6:-}" ]; then
+    browser=$6
+    shift 6
+    exec "$browser" --test-type --disable-infobars --start-maximized --hide-crash-restore-bubble "$@"
+  elif [ "${3:-}" = --headless=new ] && [ "${4:-}" = --garmoosha-browser ] && [ -n "${5:-}" ]; then
+    browser=$5
+    shift 5
+    exec "$browser" --test-type --disable-infobars --headless=new "$@"
+  fi
+fi
 if [ "${1:-}" = --garmoosha-browser ]; then
   GARMOOSHA_SCREEN_BROWSER=$2
   shift 2
+  # If this launcher is the outer wrapper, hand off before adding flags so
+  # Murmur can still read its executable selector as the first argument.
+  if [ "$GARMOOSHA_SCREEN_BROWSER" = "$(dirname "$0")/../murmur-screen/chromium" ] ||
+     [ "$GARMOOSHA_SCREEN_BROWSER" = "$(dirname "$(dirname "$0")")/murmur-screen/chromium" ]; then
+    if [ "${1:-}" = --murmur-browser ] && [ -n "${2:-}" ]; then
+      exec "$GARMOOSHA_SCREEN_BROWSER" "$@"
+    fi
+  fi
 fi
 if [ -n "${DISPLAY:-}" ]; then
   named() {
